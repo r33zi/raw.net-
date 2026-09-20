@@ -162,14 +162,6 @@ static std::uint32_t _GetProcessId(std::string process_name) {
     return 0;
 }
 
-DWORD Menuthread(LPVOID in) {
-    while (1) {
-        if (MouseController::GetAsyncKeyState(VK_INSERT) & 1)
-            ShowMenu = !ShowMenu;
-        Sleep(1);
-    }
-}
-
 std::string random_string(std::string::size_type length) {
     static auto& chrs = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#%^&*()";
     thread_local static std::mt19937 rg{ std::random_device{}() };
@@ -246,9 +238,6 @@ int main(int argc, const char* argv[]) {
     printf("[+] Initializing mouse controller...\n");
     MouseController::Init();
     printf("[+] Mouse controller OK\n");
-    CreateThread(NULL, NULL, Menuthread, NULL, NULL, NULL);
-    printf("[+] Menu thread started\n");
-
     printf("\n[*] Step 1: Looking for game window...\n");
     const char* windowTitles[] = {
         "Rainbow Six", "R6Game", "RainbowSix",
@@ -320,26 +309,9 @@ int main(int argc, const char* argv[]) {
     return 0;
 }
 
-void SetWindowToTarget() {
-    while (true) {
-        if (hwnd) {
-            ZeroMemory(&GameRect, sizeof(GameRect));
-            GetWindowRect(hwnd, &GameRect);
-            Width = GameRect.right - GameRect.left;
-            Height = GameRect.bottom - GameRect.top;
-            DWORD dwStyle = GetWindowLong(hwnd, GWL_STYLE);
-            if (dwStyle & WS_BORDER) { GameRect.top += 32; Height -= 39; }
-            ScreenCenterX = Width / 2;
-            ScreenCenterY = Height / 2;
-            MoveWindow(Window, GameRect.left, GameRect.top, Width, Height, true);
-        } else { exit(0); }
-    }
-}
-
 const MARGINS Margin = { -1 };
 
 void xCreateWindow() {
-    CreateThread(0, 0, (LPTHREAD_START_ROUTINE)SetWindowToTarget, 0, 0, 0);
     WNDCLASS windowClass = { 0 };
     windowClass.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
     windowClass.hCursor = LoadCursor(NULL, IDC_ARROW);
@@ -368,6 +340,7 @@ void xInitD3d() {
     d3dpp.EnableAutoDepthStencil = TRUE;
     d3dpp.hDeviceWindow = Window;
     d3dpp.Windowed = TRUE;
+    d3dpp.PresentationInterval = D3DPRESENT_INTERVAL_ONE;
     if (FAILED(p_Object->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, Window,
         D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &D3dDevice))) {
         p_Object->Release(); p_Object = nullptr; exit(4);
@@ -844,10 +817,11 @@ void xMainLoop() {
     static RECT old_rc;
     ZeroMemory(&Message, sizeof(MSG));
     while (Message.message != WM_QUIT) {
-        if (PeekMessage(&Message, Window, 0, 0, PM_REMOVE)) {
+        while (PeekMessage(&Message, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&Message);
             DispatchMessage(&Message);
         }
+        if (Message.message == WM_QUIT) break;
         HWND hwnd_active = GetForegroundWindow();
         if (hwnd_active == hwnd) {
             HWND hwndtest = GetWindow(hwnd_active, GW_HWNDPREV);
