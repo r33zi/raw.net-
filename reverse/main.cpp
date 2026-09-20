@@ -5,7 +5,6 @@
 #include <dwmapi.h>
 #include <vector>
 #include <random>
-#include <cctype>
 #include "Keybind.h"
 #include "color.hpp"
 #include "json.hpp"
@@ -163,53 +162,6 @@ static std::uint32_t _GetProcessId(std::string process_name) {
     return 0;
 }
 
-static bool ContainsTextInsensitive(const char* value, const char* needle) {
-    if (!value || !needle) return false;
-    std::string haystack(value);
-    std::string search(needle);
-    std::transform(haystack.begin(), haystack.end(), haystack.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    std::transform(search.begin(), search.end(), search.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return haystack.find(search) != std::string::npos;
-}
-
-struct OverlayHostSearch {
-    HWND window = NULL;
-    const char* name = nullptr;
-};
-
-static BOOL CALLBACK FindOverlayHostProc(HWND candidate, LPARAM param) {
-    OverlayHostSearch* search = reinterpret_cast<OverlayHostSearch*>(param);
-    if (!IsWindowVisible(candidate))
-        return TRUE;
-
-    char title[256] = {};
-    char className[256] = {};
-    GetWindowTextA(candidate, title, sizeof(title));
-    GetClassNameA(candidate, className, sizeof(className));
-
-    const bool medalOverlay =
-        (ContainsTextInsensitive(title, "medal") || ContainsTextInsensitive(className, "medal")) &&
-        (ContainsTextInsensitive(title, "overlay") || ContainsTextInsensitive(className, "overlay"));
-    const bool stealeriesOverlay =
-        ContainsTextInsensitive(title, "stealeries.gg") ||
-        ContainsTextInsensitive(className, "stealeries.gg");
-
-    if (medalOverlay || stealeriesOverlay) {
-        search->window = candidate;
-        search->name = medalOverlay ? "Medal" : "stealeries.gg";
-        return FALSE;
-    }
-    return TRUE;
-}
-
-static OverlayHostSearch FindOverlayHost() {
-    OverlayHostSearch search;
-    EnumWindows(FindOverlayHostProc, reinterpret_cast<LPARAM>(&search));
-    return search;
-}
-
 std::string random_string(std::string::size_type length) {
     static auto& chrs = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#%^&*()";
     thread_local static std::mt19937 rg{ std::random_device{}() };
@@ -360,7 +312,6 @@ int main(int argc, const char* argv[]) {
 const MARGINS Margin = { -1 };
 
 void xCreateWindow() {
-    OverlayHostSearch overlayHost = FindOverlayHost();
     WNDCLASS windowClass = { 0 };
     windowClass.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
     windowClass.hCursor = LoadCursor(NULL, IDC_ARROW);
@@ -369,15 +320,12 @@ void xCreateWindow() {
     windowClass.lpszClassName = "notepad";
     windowClass.style = CS_HREDRAW | CS_VREDRAW;
     RegisterClass(&windowClass);
-    Window = CreateWindowExA(WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+    Window = CreateWindowExA(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT |
+        WS_EX_TOOLWINDOW | WS_EX_LAYERED,
         "notepad", NULL, WS_POPUP, 0, 0,
         GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN),
-        overlayHost.window, NULL, NULL, NULL);
-    if (overlayHost.window)
-        printf("[+] Using %s overlay window as host\n", overlayHost.name);
-    else
-        printf("[.] Medal/stealeries.gg overlay not found; using standalone host\n");
-    ShowWindow(Window, SW_SHOW);
+        NULL, NULL, NULL, NULL);
+    ShowWindow(Window, SW_SHOWNOACTIVATE);
     DwmExtendFrameIntoClientArea(Window, &Margin);
     UpdateWindow(Window);
 }
@@ -579,7 +527,10 @@ static int QueryServerMenuStyle(int userId) {
 void render() {
     ImGui_ImplDX9_NewFrame();
     ImGui_ImplWin32_NewFrame();
-    if (GetAsyncKeyState(VK_INSERT) & 1) ShowMenu = !ShowMenu;
+    static bool insertWasDown = false;
+    const bool insertIsDown = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
+    if (insertIsDown && !insertWasDown) ShowMenu = !ShowMenu;
+    insertWasDown = insertIsDown;
     UpdateOverlayInteractivity();
     UpdateOverlayInput();
     ImGui::NewFrame();
@@ -906,9 +857,11 @@ void xMainLoop() {
         }
         if (Message.message == WM_QUIT) break;
         HWND hwnd_active = GetForegroundWindow();
-        if (hwnd_active == hwnd) {
-            HWND hwndtest = GetWindow(hwnd_active, GW_HWNDPREV);
-            SetWindowPos(Window, hwndtest, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        if (hwnd_active == hwnd || hwnd_active == Window) {
+            SetWindowPos(Window, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        } else {
+            ShowWindow(Window, SW_HIDE);
         }
         if (GetAsyncKeyState(0x23) & 1) exit(8);
         RECT rc; POINT xy;
