@@ -5,6 +5,7 @@
 #include <dwmapi.h>
 #include <vector>
 #include <random>
+#include <cctype>
 #include "Keybind.h"
 #include "color.hpp"
 #include "json.hpp"
@@ -120,15 +121,19 @@ struct FBoxSphereBounds {
     double SphereRadius;
 };
 
-static void xCreateWindow();
-static void xInitD3d();
+static bool xCreateWindow();
+static bool xInitD3d();
 static void xMainLoop();
 static void xShutdown();
 void SubmitDrawCalls();
-static LRESULT CALLBACK WinProc(HWND hWnd, UINT Message, WPARAM wParam, LPARAM lParam);
-extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 static HWND Window = NULL;
+static LONG_PTR g_medalStyle = 0;
+static LONG_PTR g_medalExStyle = 0;
+static WINDOWPLACEMENT g_medalPlacement = { sizeof(WINDOWPLACEMENT) };
+static bool g_medalWasVisible = false;
+static bool g_medalStateCaptured = false;
+static bool g_medalPlacementCaptured = false;
 IDirect3D9Ex* p_Object = NULL;
 static LPDIRECT3DDEVICE9 D3dDevice = NULL;
 static LPDIRECT3DVERTEXBUFFER9 TriBuf = NULL;
@@ -143,7 +148,7 @@ inline void K2_DrawLineXD(Vector3 ScreenPositionA, Vector3 ScreenPositionB, floa
 struct HandleDisposer {
     using pointer = HANDLE;
     void operator()(HANDLE handle) const {
-        if (handle != NULL || handle != INVALID_HANDLE_VALUE)
+        if (handle != NULL && handle != INVALID_HANDLE_VALUE)
             CloseHandle(handle);
     }
 };
@@ -160,6 +165,108 @@ static std::uint32_t _GetProcessId(std::string process_name) {
             return processentry.th32ProcessID;
     } while (Process32Next(snapshot_handle.get(), &processentry) == TRUE);
     return 0;
+}
+
+static bool ContainsTextInsensitive(const char* value, const char* needle) {
+    if (!value || !needle) return false;
+
+    std::string haystack(value);
+    std::string search(needle);
+    std::transform(haystack.begin(), haystack.end(), haystack.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(search.begin(), search.end(), search.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return haystack.find(search) != std::string::npos;
+}
+
+static bool IsMedalProcessWindow(HWND candidate) {
+    DWORD candidateProcessId = 0;
+    GetWindowThreadProcessId(candidate, &candidateProcessId);
+    if (candidateProcessId == 0) return false;
+
+    const unique_handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+        candidateProcessId));
+    if (!process || process.get() == INVALID_HANDLE_VALUE) return false;
+
+    char imagePath[MAX_PATH] = {};
+    DWORD imagePathSize = ARRAYSIZE(imagePath);
+    if (!QueryFullProcessImageNameA(process.get(), 0, imagePath, &imagePathSize)) return false;
+
+    const char* imageName = strrchr(imagePath, '\\');
+    imageName = imageName ? imageName + 1 : imagePath;
+    return ContainsTextInsensitive(imageName, "medal");
+}
+
+struct MedalOverlaySearch {
+    HWND window = NULL;
+    int score = -1;
+};
+
+static BOOL CALLBACK FindMedalOverlayProc(HWND candidate, LPARAM param) {
+    char title[256] = {};
+    char className[256] = {};
+    GetWindowTextA(candidate, title, ARRAYSIZE(title));
+    GetClassNameA(candidate, className, ARRAYSIZE(className));
+
+    const bool hasMedalName = ContainsTextInsensitive(title, "medal") ||
+        ContainsTextInsensitive(className, "medal");
+    const bool hasOverlayName = ContainsTextInsensitive(title, "overlay") ||
+        ContainsTextInsensitive(className, "overlay");
+    const bool isMedalProcess = IsMedalProcessWindow(candidate);
+    if (!hasOverlayName || !isMedalProcess) return TRUE;
+
+    int score = 0;
+    if (isMedalProcess) score += 100;
+    if (hasMedalName) score += 40;
+    if (IsWindowVisible(candidate)) score += 20;
+    if (ContainsTextInsensitive(className, "medaloverlay")) score += 30;
+    if (ContainsTextInsensitive(title, "medaloverlay")) score += 30;
+
+    RECT bounds = {};
+    if (GetWindowRect(candidate, &bounds)) {
+        const LONG width = bounds.right - bounds.left;
+        const LONG height = bounds.bottom - bounds.top;
+        if (width >= GetSystemMetrics(SM_CXSCREEN) / 2 &&
+            height >= GetSystemMetrics(SM_CYSCREEN) / 2)
+            score += 10;
+    }
+
+    MedalOverlaySearch* search = reinterpret_cast<MedalOverlaySearch*>(param);
+    if (score > search->score) {
+        search->window = candidate;
+        search->score = score;
+    }
+    return TRUE;
+}
+
+static HWND FindMedalOverlay() {
+    MedalOverlaySearch search;
+    EnumWindows(FindMedalOverlayProc, reinterpret_cast<LPARAM>(&search));
+    return search.window;
+}
+
+static bool GetGameClientBounds(RECT* bounds) {
+    if (!bounds || !IsWindow(hwnd)) return false;
+
+    RECT client = {};
+    POINT origin = {};
+    if (!GetClientRect(hwnd, &client) || !ClientToScreen(hwnd, &origin)) return false;
+
+    bounds->left = origin.x;
+    bounds->top = origin.y;
+    bounds->right = origin.x + (client.right - client.left);
+    bounds->bottom = origin.y + (client.bottom - client.top);
+    return bounds->right > bounds->left && bounds->bottom > bounds->top;
+}
+
+static bool IsGameOrOverlayForeground() {
+    HWND foreground = GetForegroundWindow();
+    if (!foreground) return false;
+    if (foreground == hwnd || foreground == Window) return true;
+
+    DWORD foregroundProcessId = 0;
+    GetWindowThreadProcessId(foreground, &foregroundProcessId);
+    return foregroundProcessId != 0 && foregroundProcessId == processID;
 }
 
 std::string random_string(std::string::size_type length) {
@@ -295,11 +402,21 @@ int main(int argc, const char* argv[]) {
     else printf("[!] R6 scan failed\n");
 
     g_lastRainbowTick = GetTickCount();
-    printf("\n[*] Step 4: Creating overlay...\n");
-    xCreateWindow();
-    printf("[+] Overlay created\n");
+    printf("\n[*] Step 4: Finding Medal overlay...\n");
+    if (!xCreateWindow()) {
+        printf("[!] Medal overlay was not found. Start Medal, enable its game overlay, then retry.\n");
+        xShutdown();
+        system("pause");
+        return 1;
+    }
+    printf("[+] Medal overlay acquired\n");
     printf("[*] Step 5: Init DirectX 9...\n");
-    xInitD3d();
+    if (!xInitD3d()) {
+        printf("[!] DirectX 9 initialization failed.\n");
+        xShutdown();
+        system("pause");
+        return 1;
+    }
     printf("[+] DirectX 9 OK\n");
     printf("\n[*] ALL SYSTEMS GO\n");
     Sleep(3000);
@@ -309,29 +426,39 @@ int main(int argc, const char* argv[]) {
     return 0;
 }
 
-const MARGINS Margin = { -1 };
+bool xCreateWindow() {
+    for (int attempt = 0; attempt < 40 && !Window; ++attempt) {
+        Window = FindMedalOverlay();
+        if (!Window) Sleep(250);
+    }
+    if (!Window) return false;
 
-void xCreateWindow() {
-    WNDCLASS windowClass = { 0 };
-    windowClass.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
-    windowClass.hCursor = LoadCursor(NULL, IDC_ARROW);
-    windowClass.hInstance = NULL;
-    windowClass.lpfnWndProc = WinProc;
-    windowClass.lpszClassName = "notepad";
-    windowClass.style = CS_HREDRAW | CS_VREDRAW;
-    RegisterClass(&windowClass);
-    Window = CreateWindowExA(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT |
-        WS_EX_TOOLWINDOW | WS_EX_LAYERED,
-        "notepad", NULL, WS_POPUP, 0, 0,
-        GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN),
-        NULL, NULL, NULL, NULL);
-    ShowWindow(Window, SW_SHOWNOACTIVATE);
-    DwmExtendFrameIntoClientArea(Window, &Margin);
+    g_medalStyle = GetWindowLongPtr(Window, GWL_STYLE);
+    g_medalExStyle = GetWindowLongPtr(Window, GWL_EXSTYLE);
+    g_medalPlacement.length = sizeof(WINDOWPLACEMENT);
+    g_medalPlacementCaptured = GetWindowPlacement(Window, &g_medalPlacement) != FALSE;
+    g_medalWasVisible = IsWindowVisible(Window) != FALSE;
+    g_medalStateCaptured = true;
+
+    const LONG_PTR overlayExStyle = g_medalExStyle | WS_EX_TOPMOST | WS_EX_NOACTIVATE |
+        WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_LAYERED;
+    SetLastError(ERROR_SUCCESS);
+    if (SetWindowLongPtr(Window, GWL_EXSTYLE, overlayExStyle) == 0 &&
+        GetLastError() != ERROR_SUCCESS)
+        return false;
+
+    RECT bounds = {};
+    if (!GetGameClientBounds(&bounds)) return false;
+    Width = bounds.right - bounds.left;
+    Height = bounds.bottom - bounds.top;
+    SetWindowPos(Window, HWND_TOPMOST, bounds.left, bounds.top, Width, Height,
+        SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
     UpdateWindow(Window);
+    return true;
 }
 
-void xInitD3d() {
-    if (FAILED(Direct3DCreate9Ex(D3D_SDK_VERSION, &p_Object))) exit(3);
+bool xInitD3d() {
+    if (FAILED(Direct3DCreate9Ex(D3D_SDK_VERSION, &p_Object))) return false;
     ZeroMemory(&d3dpp, sizeof(d3dpp));
     d3dpp.BackBufferWidth = Width;
     d3dpp.BackBufferHeight = Height;
@@ -345,13 +472,22 @@ void xInitD3d() {
     d3dpp.PresentationInterval = D3DPRESENT_INTERVAL_ONE;
     if (FAILED(p_Object->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, Window,
         D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &D3dDevice))) {
-        p_Object->Release(); p_Object = nullptr; exit(4);
+        p_Object->Release();
+        p_Object = nullptr;
+        return false;
     }
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO(); (void)io;
-    ImGui_ImplWin32_Init(Window);
-    ImGui_ImplDX9_Init(D3dDevice);
+    if (!ImGui_ImplWin32_Init(Window)) {
+        ImGui::DestroyContext();
+        return false;
+    }
+    if (!ImGui_ImplDX9_Init(D3dDevice)) {
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+        return false;
+    }
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
     style.Alpha = 1.0f;
@@ -408,6 +544,7 @@ void xInitD3d() {
     m_pFont = io.Fonts->AddFontFromFileTTF(font.decrypt(), 13.0f, nullptr, io.Fonts->GetGlyphRangesDefault());
     if (m_pFont == nullptr) m_pFont = io.Fonts->AddFontDefault();
     p_Object->Release(); p_Object = nullptr;
+    return true;
 }
 
 void aimbot(float x, float y) {
@@ -458,6 +595,19 @@ static void UpdateOverlayInteractivity() {
     SetWindowPos(Window, NULL, 0, 0, 0, 0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     previousMenuState = ShowMenu;
+}
+
+static bool ResetD3dDevice() {
+    if (!D3dDevice) return false;
+
+    ReleaseShaderResources();
+    ImGui_ImplDX9_InvalidateDeviceObjects();
+    const HRESULT result = D3dDevice->Reset(&d3dpp);
+    if (FAILED(result)) return false;
+
+    ImGui_ImplDX9_CreateDeviceObjects();
+    LoadShaderResources(D3dDevice);
+    return true;
 }
 
 void SubmitDrawCalls() {
@@ -551,6 +701,8 @@ void render() {
         static const char* snapOriginItems[] = { "Bottom", "Center", "Top" };
 
         ImGui::SetNextWindowSize(ImVec2(560.0f, 640.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowPos(ImVec2(Width * 0.5f, Height * 0.5f),
+            ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
         ImGui::Begin(px33_get_menu_title(), &ShowMenu,
             ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse);
 
@@ -840,15 +992,14 @@ void render() {
     }
     HRESULT result = D3dDevice->Present(nullptr, nullptr, nullptr, nullptr);
     if (result == D3DERR_DEVICELOST && D3dDevice->TestCooperativeLevel() == D3DERR_DEVICENOTRESET) {
-        ImGui_ImplDX9_InvalidateDeviceObjects();
-        D3dDevice->Reset(&d3dpp);
-        ImGui_ImplDX9_CreateDeviceObjects();
+        ResetD3dDevice();
     }
 }
 
 MSG Message = { NULL };
 void xMainLoop() {
-    static RECT old_rc;
+    RECT oldBounds = {};
+    GetGameClientBounds(&oldBounds);
     ZeroMemory(&Message, sizeof(MSG));
     while (Message.message != WM_QUIT) {
         while (PeekMessage(&Message, nullptr, 0, 0, PM_REMOVE)) {
@@ -856,57 +1007,57 @@ void xMainLoop() {
             DispatchMessage(&Message);
         }
         if (Message.message == WM_QUIT) break;
-        HWND hwnd_active = GetForegroundWindow();
-        if (hwnd_active == hwnd || hwnd_active == Window) {
+        if (!IsWindow(Window)) break;
+        if (IsGameOrOverlayForeground()) {
             SetWindowPos(Window, HWND_TOPMOST, 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         } else {
             ShowWindow(Window, SW_HIDE);
         }
-        if (GetAsyncKeyState(0x23) & 1) exit(8);
-        RECT rc; POINT xy;
-        ZeroMemory(&rc, sizeof(RECT));
-        ZeroMemory(&xy, sizeof(POINT));
-        GetClientRect(hwnd, &rc);
-        ClientToScreen(hwnd, &xy);
-        rc.left = xy.x; rc.top = xy.y;
-        if (rc.left != old_rc.left || rc.right != old_rc.right || rc.top != old_rc.top || rc.bottom != old_rc.bottom) {
-            old_rc = rc;
-            Width = rc.right; Height = rc.bottom;
-            d3dpp.BackBufferWidth = Width; d3dpp.BackBufferHeight = Height;
-            SetWindowPos(Window, (HWND)0, xy.x, xy.y, Width, Height, SWP_NOREDRAW);
-            D3dDevice->Reset(&d3dpp);
+        if (GetAsyncKeyState(VK_END) & 1) break;
+
+        RECT bounds = {};
+        if (GetGameClientBounds(&bounds) && !EqualRect(&bounds, &oldBounds)) {
+            const int newWidth = bounds.right - bounds.left;
+            const int newHeight = bounds.bottom - bounds.top;
+            const bool sizeChanged = newWidth != Width || newHeight != Height;
+
+            oldBounds = bounds;
+            SetWindowPos(Window, HWND_TOPMOST, bounds.left, bounds.top, newWidth, newHeight,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW);
+
+            if (sizeChanged && newWidth > 0 && newHeight > 0) {
+                Width = newWidth;
+                Height = newHeight;
+                d3dpp.BackBufferWidth = Width;
+                d3dpp.BackBufferHeight = Height;
+                ResetD3dDevice();
+            }
         }
         render();
     }
     ImGui_ImplDX9_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
-    DestroyWindow(Window);
-}
-
-LRESULT CALLBACK WinProc(HWND hWnd, UINT Message, WPARAM wParam, LPARAM lParam) {
-    if (ImGui_ImplWin32_WndProcHandler(hWnd, Message, wParam, lParam)) return true;
-    switch (Message) {
-    case WM_DESTROY: xShutdown(); PostQuitMessage(0); exit(4); break;
-    case WM_SIZE:
-        if (D3dDevice != NULL && wParam != SIZE_MINIMIZED) {
-            ImGui_ImplDX9_InvalidateDeviceObjects();
-            d3dpp.BackBufferWidth = LOWORD(lParam); d3dpp.BackBufferHeight = HIWORD(lParam);
-            HRESULT hr = D3dDevice->Reset(&d3dpp);
-            if (hr == D3DERR_INVALIDCALL) IM_ASSERT(0);
-            ImGui_ImplDX9_CreateDeviceObjects();
-        } break;
-    default: return DefWindowProc(hWnd, Message, wParam, lParam); break;
-    }
-    return 0;
 }
 
 void xShutdown() {
     ShutdownRenderPipeline();
-    if (TriBuf) TriBuf->Release();
-    if (D3dDevice) D3dDevice->Release();
-    if (p_Object) p_Object->Release();
-    DestroyWindow(Window);
-    UnregisterClass("notepad", NULL);
+    ReleaseShaderResources();
+    if (TriBuf) { TriBuf->Release(); TriBuf = nullptr; }
+    if (D3dDevice) { D3dDevice->Release(); D3dDevice = nullptr; }
+    if (p_Object) { p_Object->Release(); p_Object = nullptr; }
+
+    if (Window && IsWindow(Window) && g_medalStateCaptured) {
+        SetWindowLongPtr(Window, GWL_STYLE, g_medalStyle);
+        SetWindowLongPtr(Window, GWL_EXSTYLE, g_medalExStyle);
+        if (g_medalPlacementCaptured)
+            SetWindowPlacement(Window, &g_medalPlacement);
+        SetWindowPos(Window, (g_medalExStyle & WS_EX_TOPMOST) ? HWND_TOPMOST : HWND_NOTOPMOST,
+            0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        ShowWindow(Window, g_medalWasVisible ? SW_SHOWNOACTIVATE : SW_HIDE);
+    }
+    Window = NULL;
+    g_medalStateCaptured = false;
+    g_medalPlacementCaptured = false;
 }
