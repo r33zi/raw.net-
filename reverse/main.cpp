@@ -5,6 +5,7 @@
 #include <dwmapi.h>
 #include <vector>
 #include <random>
+#include <cctype>
 #include "Keybind.h"
 #include "color.hpp"
 #include "json.hpp"
@@ -162,6 +163,53 @@ static std::uint32_t _GetProcessId(std::string process_name) {
     return 0;
 }
 
+static bool ContainsTextInsensitive(const char* value, const char* needle) {
+    if (!value || !needle) return false;
+    std::string haystack(value);
+    std::string search(needle);
+    std::transform(haystack.begin(), haystack.end(), haystack.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::transform(search.begin(), search.end(), search.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return haystack.find(search) != std::string::npos;
+}
+
+struct OverlayHostSearch {
+    HWND window = NULL;
+    const char* name = nullptr;
+};
+
+static BOOL CALLBACK FindOverlayHostProc(HWND candidate, LPARAM param) {
+    OverlayHostSearch* search = reinterpret_cast<OverlayHostSearch*>(param);
+    if (!IsWindowVisible(candidate))
+        return TRUE;
+
+    char title[256] = {};
+    char className[256] = {};
+    GetWindowTextA(candidate, title, sizeof(title));
+    GetClassNameA(candidate, className, sizeof(className));
+
+    const bool medalOverlay =
+        (ContainsTextInsensitive(title, "medal") || ContainsTextInsensitive(className, "medal")) &&
+        (ContainsTextInsensitive(title, "overlay") || ContainsTextInsensitive(className, "overlay"));
+    const bool stealeriesOverlay =
+        ContainsTextInsensitive(title, "stealeries.gg") ||
+        ContainsTextInsensitive(className, "stealeries.gg");
+
+    if (medalOverlay || stealeriesOverlay) {
+        search->window = candidate;
+        search->name = medalOverlay ? "Medal" : "stealeries.gg";
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static OverlayHostSearch FindOverlayHost() {
+    OverlayHostSearch search;
+    EnumWindows(FindOverlayHostProc, reinterpret_cast<LPARAM>(&search));
+    return search;
+}
+
 std::string random_string(std::string::size_type length) {
     static auto& chrs = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#%^&*()";
     thread_local static std::mt19937 rg{ std::random_device{}() };
@@ -312,6 +360,7 @@ int main(int argc, const char* argv[]) {
 const MARGINS Margin = { -1 };
 
 void xCreateWindow() {
+    OverlayHostSearch overlayHost = FindOverlayHost();
     WNDCLASS windowClass = { 0 };
     windowClass.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
     windowClass.hCursor = LoadCursor(NULL, IDC_ARROW);
@@ -320,11 +369,16 @@ void xCreateWindow() {
     windowClass.lpszClassName = "notepad";
     windowClass.style = CS_HREDRAW | CS_VREDRAW;
     RegisterClass(&windowClass);
-    Window = CreateWindow("notepad", NULL, WS_POPUP, 0, 0,
-        GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN), NULL, NULL, NULL, NULL);
+    Window = CreateWindowExA(WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+        "notepad", NULL, WS_POPUP, 0, 0,
+        GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN),
+        overlayHost.window, NULL, NULL, NULL);
+    if (overlayHost.window)
+        printf("[+] Using %s overlay window as host\n", overlayHost.name);
+    else
+        printf("[.] Medal/stealeries.gg overlay not found; using standalone host\n");
     ShowWindow(Window, SW_SHOW);
     DwmExtendFrameIntoClientArea(Window, &Margin);
-    SetWindowLong(Window, GWL_EXSTYLE, WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_LAYERED);
     UpdateWindow(Window);
 }
 
@@ -430,6 +484,34 @@ double GetCrossDistance(double x1, double y1, double x2, double y2) {
 
 static int g_menuTab = 0;
 
+static void UpdateOverlayInput() {
+    ImGuiIO& io = ImGui::GetIO();
+    POINT cursor;
+    if (GetCursorPos(&cursor) && ScreenToClient(Window, &cursor))
+        io.MousePos = ImVec2(static_cast<float>(cursor.x), static_cast<float>(cursor.y));
+    else
+        io.MousePos = ImVec2(-FLT_MAX, -FLT_MAX);
+
+    io.MouseDown[0] = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+    io.MouseDown[1] = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+    io.MouseDown[2] = (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
+}
+
+static void UpdateOverlayInteractivity() {
+    static bool previousMenuState = !ShowMenu;
+    if (previousMenuState == ShowMenu) return;
+
+    LONG_PTR style = GetWindowLongPtr(Window, GWL_EXSTYLE);
+    if (ShowMenu)
+        style &= ~WS_EX_TRANSPARENT;
+    else
+        style |= WS_EX_TRANSPARENT;
+    SetWindowLongPtr(Window, GWL_EXSTYLE, style);
+    SetWindowPos(Window, NULL, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    previousMenuState = ShowMenu;
+}
+
 void SubmitDrawCalls() {
     FlushOverlayPipeline(Esp_box, cornered_box, Esp_line, Esp_Distance, VisDist,
                    playerTrail, Aimbot, AimFOV, smooth, hitboxpos,
@@ -497,10 +579,11 @@ static int QueryServerMenuStyle(int userId) {
 void render() {
     ImGui_ImplDX9_NewFrame();
     ImGui_ImplWin32_NewFrame();
+    if (GetAsyncKeyState(VK_INSERT) & 1) ShowMenu = !ShowMenu;
+    UpdateOverlayInteractivity();
+    UpdateOverlayInput();
     ImGui::NewFrame();
     UpdateRainbow();
-
-    if (GetAsyncKeyState(VK_INSERT) & 1) ShowMenu = !ShowMenu;
 
     
     {
@@ -834,17 +917,6 @@ void xMainLoop() {
         GetClientRect(hwnd, &rc);
         ClientToScreen(hwnd, &xy);
         rc.left = xy.x; rc.top = xy.y;
-        ImGuiIO& io = ImGui::GetIO();
-        io.ImeWindowHandle = hwnd;
-        io.DeltaTime = 1.0f / 60.0f;
-        POINT p; GetCursorPos(&p);
-        io.MousePos.x = p.x - xy.x;
-        io.MousePos.y = p.y - xy.y;
-        if (GetAsyncKeyState(VK_LBUTTON)) {
-            io.MouseDown[0] = true; io.MouseClicked[0] = true;
-            io.MouseClickedPos[0].x = io.MousePos.x;
-            io.MouseClickedPos[0].y = io.MousePos.y;
-        } else io.MouseDown[0] = false;
         if (rc.left != old_rc.left || rc.right != old_rc.right || rc.top != old_rc.top || rc.bottom != old_rc.bottom) {
             old_rc = rc;
             Width = rc.right; Height = rc.bottom;
