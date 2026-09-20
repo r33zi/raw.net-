@@ -1,46 +1,44 @@
-#define GWorld 0x10AEC0B8
-#define VIEW_POINT 0xE49C7E0
+#pragma once
+
+#include <cstdint>
 
 namespace OFFSETS
 {
-    uintptr_t UWORLD = 0x10AEC0B8;
-    uintptr_t Viewpoint = 0xE49C7E0;
+    // Addresses captured from RainbowSix.exe are stored as RVAs. The runtime
+    // module base is always used so ASLR cannot invalidate a captured base.
+    static constexpr uintptr_t DumpGameBase = 0x7FF66C070000ULL;
 
-    uintptr_t Gameinstance = 0x1b8;
-    uintptr_t LocalPlayers = 0x38;
-    uintptr_t PlayerController = 0x30;
-    uintptr_t LocalPawn = 0x338;
-    uintptr_t PlayerState = 0x2b0;
-    uintptr_t RootComponet = 0x198;
-    uintptr_t GameState = 0x158;
-    uintptr_t PersistentLevel = 0x30;
-    uintptr_t LastSubmitTime = 0x368;
-    uintptr_t LastRenderTimeOnScreen = 0x370;
+    static constexpr uintptr_t ActorPatchRva = 0x00CFCE5B;
+    static constexpr uintptr_t CameraPatchRva = 0x0E6A4795;
+    static constexpr uintptr_t CodeCaveOneRva = 0x10D73294;
+    static constexpr uintptr_t CodeCaveTwoRva = 0x10D78DF4;
 
-    uintptr_t ActorCount = 0xA0;
-    uintptr_t Cameramanager = 0x348;
-    uintptr_t AActor = 0x98;
-    uintptr_t CurrentActor = 0x8;
-    uintptr_t Mesh = 0x318;
-    uintptr_t Revivefromdbnotime = 0x4b68;
-    uintptr_t TeamId = 0x10e0;
-    uintptr_t ActorTeamId = 0x10e0;
+    static constexpr uintptr_t ActorTrampolineRva = 0x000080D2;
+    static constexpr uintptr_t ActorMovRva = 0x00CFCE57;
+    static constexpr uint8_t ActorMovBytes[] = { 0x48, 0x89, 0x15 };
+    static constexpr bool ActorPatternIsTypeA = true;
 
-    uintptr_t IsDBNO = 0x872;
-    uintptr_t LocalActorPos = 0x128;
-    uintptr_t ComponetToWorld = 0x240;
-    uintptr_t BoneArray = 0x620;
-    uintptr_t Bonecache = 0x658;
-    uintptr_t Velocity = 0xb8;
-    uintptr_t Private = 0x308;
-    uintptr_t PlayerArray = 0x2A8;
-    uintptr_t relativelocation = 0x128;
-    uintptr_t UCharacterMovementComponent = 0x318;
-    uintptr_t entity_actor = 0x310;
-    uintptr_t bIsReloadingWeapon = 0x358;
-    uintptr_t GlobalAnimRateScale = 0xA80;
-    uintptr_t CurrentWeapon = 0x948;
-    uintptr_t Wireframe = 0x194;
-    uintptr_t SkeletalMeshes = 0x56e;
-    uintptr_t PawnMaterials_ALL = 0x5A60;
+    static constexpr uintptr_t CameraMovRva = 0x0E6A4779;
+    static constexpr uintptr_t CameraTrampolineRva = 0x00052192;
+    static constexpr uint32_t CameraCaptureRegisterIndex = 2; // supplied as r2
+
+    static constexpr uintptr_t ViewMatrixRva = 0x11FB8EF0;
+    static constexpr uintptr_t ViewBlockAddress = 0x00000000;
+    static constexpr uintptr_t CameraPositionOffset = 0x190;
+    static constexpr uintptr_t ViewProjectionOffset = 0x250;
+
+    static constexpr const char* CameraOneSignature =
+        "48 8B 0D ?? ?? ?? ?? 4C 8B 01 41 FF 90 D8 00 00 00 F3 0F 10";
+    static constexpr const char* CameraTwoSignature =
+        "48 8B 0D ?? ?? ?? ?? 48 8B 01 FF 90 D8 00 00 00 F3 0F 10";
+    static constexpr const char* GameManagerSignature =
+        "48 8B 0D ?? ?? ?? ?? 48 85 C9 0F 84 ?? ?? ?? ?? 48 8B 01 FF 90";
+    static constexpr const char* EntitySignature =
+        "FF 91 E0 00 00 00 8B B8 10 01 00 00";
+    static constexpr const char* ViewMatrixSignature =
+        "48 8B 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 90 48 83 C4 58 41 5D 41 5C 41 5F 5E 5B 5F 5D";
+    static constexpr const char* ViewAnchorSignature =
+        "A4 70 7D BF 00 00 00 00 00 00 00 00 00 00 A0 40 "
+        "00 00 A0 C0 00 00 00 00 00 00 00 00 CD CC 4C 3F "
+        "00 00 00 3F 00 00 80 3E";
 }

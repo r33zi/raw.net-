@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdarg>
+#include <cfloat>
 #include <cmath>
 #include <vector>
 #include <unordered_set>
@@ -21,6 +22,174 @@ struct Vec3 { float x, y, z; };
 struct Matrix4x4 { float m[16]; };
 enum class ActorStatus { VALID, DEAD_1, DEAD_2, TEAM, LOCAL, INVALID };
 
+static bool IsValidAddr(uint64_t p){return p>0x10000ULL&&p<0x7FFFFFFFFFFFULL;}
+
+static bool ValidateWorldCoord(Vec3 v){
+    if (!std::isfinite(v.x) || !std::isfinite(v.y) || !std::isfinite(v.z))
+        return false;
+    if(fabsf(v.x)>=500000.f||fabsf(v.y)>=500000.f||fabsf(v.z)>=500000.f)
+        return false;
+    int s=(fabsf(v.x)>2.f?1:0)+(fabsf(v.y)>2.f?1:0)+(fabsf(v.z)>2.f?1:0);
+    return s>=2;
+}
+
+// Character-component transform fields drift between game builds. Resolve
+// the physics anchor from the live +0xB00 position and discover the rotation
+// quaternion from the small set of layouts observed by the animation reader.
+static std::atomic<uint32_t> g_physWorldOff{0};
+static std::atomic<uint32_t> g_rotQuatOff{0};
+static std::mutex g_physWorldDiscoveryMtx;
+static uint32_t g_physWorldCandidateOff = 0;
+static Vec3 g_physWorldCandidateLive{};
+static uint32_t g_physWorldCandidateConfirmations = 0;
+
+static bool FindPhysWorldOffset(uint64_t component) {
+    if (g_physWorldOff.load(std::memory_order_acquire)) return true;
+    if (!IsValidAddr(component)) return false;
+
+    Vec3 live{};
+    if (driver->ReadProcessMemory(component + 0xB00, &live, sizeof(live)) != 0 ||
+        !ValidateWorldCoord(live)) return false;
+
+    float bestDistanceSq = FLT_MAX;
+    uint32_t bestOffset = 0;
+    for (uint32_t offset = 0x80; offset + sizeof(Vec3) <= 0x2F0; offset += 4) {
+        Vec3 candidate{};
+        if (driver->ReadProcessMemory(component + offset, &candidate, sizeof(candidate)) != 0)
+            continue;
+        if (!ValidateWorldCoord(candidate)) continue;
+        const float dx = candidate.x - live.x;
+        const float dy = candidate.y - live.y;
+        const float dz = candidate.z - live.z;
+        const float distanceSq = dx * dx + dy * dy + dz * dz;
+        if (distanceSq < bestDistanceSq) {
+            bestDistanceSq = distanceSq;
+            bestOffset = offset;
+        }
+    }
+    if (!bestOffset || bestDistanceSq > 9.0f) return false;
+    std::lock_guard<std::mutex> lock(g_physWorldDiscoveryMtx);
+    if (g_physWorldOff.load(std::memory_order_acquire)) return true;
+
+    const float moveX = live.x - g_physWorldCandidateLive.x;
+    const float moveY = live.y - g_physWorldCandidateLive.y;
+    const float moveZ = live.z - g_physWorldCandidateLive.z;
+    const float movementSq = moveX * moveX + moveY * moveY + moveZ * moveZ;
+    if (g_physWorldCandidateOff != bestOffset) {
+        g_physWorldCandidateOff = bestOffset;
+        g_physWorldCandidateLive = live;
+        g_physWorldCandidateConfirmations = 1;
+        return false;
+    }
+    if (movementSq < 0.01f) return false;
+
+    g_physWorldCandidateLive = live;
+    if (++g_physWorldCandidateConfirmations >= 2) {
+        g_physWorldOff.store(bestOffset, std::memory_order_release);
+        printf("[SKEL] Physics anchor offset: +0x%X\n", bestOffset);
+        return true;
+    }
+    return false;
+}
+
+static bool FindRotQuatOffset(uint64_t component) {
+    if (g_rotQuatOff.load(std::memory_order_acquire)) return true;
+    if (!IsValidAddr(component)) return false;
+
+    static constexpr uint32_t candidates[] = { 0x660, 0x650, 0x670, 0x640, 0x680 };
+    for (uint32_t offset : candidates) {
+        float q[4]{};
+        if (driver->ReadProcessMemory(component + offset, q, sizeof(q)) != 0) continue;
+        bool finite = true;
+        for (float value : q)
+            finite = finite && std::isfinite(value) && fabsf(value) <= 1.01f;
+        if (!finite) continue;
+        const float magnitudeSq = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
+        if (magnitudeSq < 0.95f || magnitudeSq > 1.05f) continue;
+        uint32_t expected = 0;
+        if (g_rotQuatOff.compare_exchange_strong(expected, offset,
+                std::memory_order_release, std::memory_order_relaxed)) {
+            printf("[SKEL] Rotation quaternion offset: +0x%X\n", offset);
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool GetEntityRotQuat(uint64_t component, float* out) {
+    if (!out) return false;
+    uint32_t offset = g_rotQuatOff.load(std::memory_order_acquire);
+    if (!offset && (!FindRotQuatOffset(component) ||
+            !(offset = g_rotQuatOff.load(std::memory_order_acquire)))) return false;
+    if (driver->ReadProcessMemory(component + offset, out, sizeof(float) * 4) != 0)
+        return false;
+    const float magnitudeSq = out[0] * out[0] + out[1] * out[1] +
+        out[2] * out[2] + out[3] * out[3];
+    if (!std::isfinite(magnitudeSq) || magnitudeSq < 0.8f || magnitudeSq > 1.2f)
+        return false;
+    const float inverseLength = 1.0f / sqrtf(magnitudeSq);
+    for (int i = 0; i < 4; ++i) out[i] *= inverseLength;
+    return true;
+}
+
+static bool GetPhysWorldPos(uint64_t component, Vec3& out) {
+    Vec3 live{};
+    if (driver->ReadProcessMemory(component + 0xB00, &live, sizeof(live)) != 0 ||
+        !ValidateWorldCoord(live)) return false;
+
+    uint32_t offset = g_physWorldOff.load(std::memory_order_acquire);
+    if (offset) {
+        Vec3 candidate{};
+        if (driver->ReadProcessMemory(component + offset, &candidate, sizeof(candidate)) == 0 &&
+            ValidateWorldCoord(candidate)) {
+            const float dx = candidate.x - live.x;
+            const float dy = candidate.y - live.y;
+            const float dz = candidate.z - live.z;
+            if (dx * dx + dy * dy + dz * dz <= 9.0f) {
+                out = candidate;
+                return true;
+            }
+        }
+        std::lock_guard<std::mutex> lock(g_physWorldDiscoveryMtx);
+        uint32_t staleOffset = offset;
+        if (g_physWorldOff.compare_exchange_strong(staleOffset, 0,
+                std::memory_order_acq_rel, std::memory_order_acquire)) {
+            g_physWorldCandidateOff = 0;
+            g_physWorldCandidateLive = {};
+            g_physWorldCandidateConfirmations = 0;
+        }
+    }
+
+    if (FindPhysWorldOffset(component)) {
+        offset = g_physWorldOff.load(std::memory_order_acquire);
+        Vec3 candidate{};
+        if (offset &&
+            driver->ReadProcessMemory(component + offset, &candidate, sizeof(candidate)) == 0 &&
+            ValidateWorldCoord(candidate)) {
+            const float dx = candidate.x - live.x;
+            const float dy = candidate.y - live.y;
+            const float dz = candidate.z - live.z;
+            if (dx * dx + dy * dy + dz * dz <= 9.0f) {
+                out = candidate;
+                return true;
+            }
+        }
+    }
+
+    out = live;
+    return true;
+}
+
+static bool ReadSkeletonRotation(uint64_t component, float* out) {
+    return GetEntityRotQuat(component, out);
+}
+
+static bool ReadSkeletonAnchor(uint64_t component, void* out) {
+    return out && GetPhysWorldPos(component, *static_cast<Vec3*>(out));
+}
+
+#include "r6_bones.h"
+
 struct OverlayVertex {
     uint64_t instance;
     Vec3 position;
@@ -30,6 +199,9 @@ struct OverlayVertex {
     Vec3 screenPos;
     bool onScreen;
     bool hasBones;
+    SkeletonBones bones;
+    Vec3 headScreenPos;
+    bool headOnScreen;
     char operatorName[32];
     int  hp;
 };
@@ -59,6 +231,10 @@ extern bool rainbowMode;
 extern bool rainbowBox;
 extern bool rainbowFov;
 extern bool rainbowSnaplines;
+extern bool Esp_skeleton;
+extern bool skeletonAim;
+extern float espSkeletonColor[4];
+extern float skeletonThickness;
 
 extern ImU32 GetBoxColor(float offset);
 extern ImU32 GetSnaplineColor(float offset);
@@ -75,6 +251,9 @@ static void DBG(const char* fmt, ...) {
 }
 
 static uint64_t g_projectionAddr = 0;
+static Matrix4x4 g_frameProjection{};
+static Vec3 g_frameCamera{};
+static bool g_frameProjectionValid = false;
 static uint64_t g_frameSyncAddr = 0;
 static uint64_t g_imageBase = 0;
 static uint64_t g_ShellPage = 0;
@@ -85,6 +264,7 @@ static int      g_PatchLen = 0;
 static size_t   g_ShellSize = 0;
 static DWORD    g_frameSyncStart = 0;
 static bool     g_syncComplete = false;
+static HANDLE   g_registryScanThread = NULL;
 static constexpr DWORD COLLECT_MS = 499;
 
 static std::vector<OverlayVertex> g_vertexBuffer;
@@ -147,10 +327,37 @@ static int FindBoundary(const uint8_t* c, int minB) {
     return p;
 }
 
-static Matrix4x4 QueryProjectionMatrix() { return g_projectionAddr ? read<Matrix4x4>(g_projectionAddr+0x250) : Matrix4x4{}; }
-static Vec3 QueryCameraOrigin() { return g_projectionAddr ? read<Vec3>(g_projectionAddr+0x190) : Vec3{}; }
+static void RefreshConfiguredProjection() {
+    if (!g_pViewDataPtr) return;
+    const uint64_t viewData = read<uint64_t>(g_pViewDataPtr);
+    if (IsValidAddr(viewData)) g_projectionAddr = viewData;
+}
+
+static void CaptureProjectionFrame() {
+    RefreshConfiguredProjection();
+    g_frameProjection = {};
+    g_frameCamera = {};
+    g_frameProjectionValid = false;
+    if (!IsValidAddr(g_projectionAddr)) return;
+
+    if (driver->ReadProcessMemory(
+            g_projectionAddr + OFFSETS::ViewProjectionOffset,
+            &g_frameProjection, sizeof(g_frameProjection)) != 0) return;
+    driver->ReadProcessMemory(
+        g_projectionAddr + OFFSETS::CameraPositionOffset,
+        &g_frameCamera, sizeof(g_frameCamera));
+    g_frameProjectionValid = true;
+}
+
+static Matrix4x4 QueryProjectionMatrix() {
+    return g_frameProjectionValid ? g_frameProjection : Matrix4x4{};
+}
+
+static Vec3 QueryCameraOrigin() {
+    return g_frameProjectionValid ? g_frameCamera : Vec3{};
+}
 static bool W2S(const Vec3& w, Vec3& s, int W, int H) {
-    if (!g_projectionAddr) return false;
+    if (!g_frameProjectionValid) return false;
     Matrix4x4 v=QueryProjectionMatrix();
     float ww=v.m[3]*w.x+v.m[7]*w.y+v.m[11]*w.z+v.m[15];
     if (ww<0.001f) return false;
@@ -160,17 +367,6 @@ static bool W2S(const Vec3& w, Vec3& s, int W, int H) {
 }
 
 #include "weather_fx.h"
-
-static bool IsValidAddr(uint64_t p){return p>0x10000ULL&&p<0x7FFFFFFFFFFFULL;}
-
-static bool ValidateWorldCoord(Vec3 v){
-    if (!std::isfinite(v.x) || !std::isfinite(v.y) || !std::isfinite(v.z))
-        return false;
-    if(fabsf(v.x)>=500000.f||fabsf(v.y)>=500000.f||fabsf(v.z)>=500000.f)
-        return false;
-    int s=(fabsf(v.x)>2.f?1:0)+(fabsf(v.y)>2.f?1:0)+(fabsf(v.z)>2.f?1:0);
-    return s>=2;
-}
 
 static bool ValidatePtr(uint64_t e){
     if(!IsValidAddr(e))return false;if(!IsValidAddr(read<uint64_t>(e)))return false;
@@ -308,6 +504,7 @@ static void FlushSyncBuffer() {
     std::lock_guard<std::mutex> lock(g_syncMapMtx);
     g_syncMap.clear();
     FlushShaderSigCache();
+    FlushBoneCache();
 }
 
 static int ReadRound() {
@@ -440,8 +637,25 @@ static bool InitRenderPipeline(uint64_t base, uint64_t size) {
     auto secs=GetPESections(base);
     if(secs.empty()) return false;
     if(!CacheTextSection(base,secs)) return false;
+    ScanConfiguredPointers(base);
     auto calls=FindEntityFunctionCalls(base);
-    for(auto& c:calls) if(c.hasTestAlAl){g_frameSyncAddr=c.targetVA;break;}
+
+    // Prefer the supplied actor capture site when its preceding MOV bytes
+    // match this build. Retain signature-based discovery as a safe fallback.
+    if (OFFSETS::ActorMovRva + sizeof(OFFSETS::ActorMovBytes) <= size &&
+        OFFSETS::ActorPatchRva + 32 <= size) {
+        uint8_t actorMov[sizeof(OFFSETS::ActorMovBytes)]{};
+        if (driver->ReadProcessMemory(base + OFFSETS::ActorMovRva,
+                actorMov, sizeof(actorMov)) == 0 &&
+            memcmp(actorMov, OFFSETS::ActorMovBytes, sizeof(actorMov)) == 0) {
+            g_frameSyncAddr = base + OFFSETS::ActorPatchRva;
+            printf("[ENTITY-SCAN] Using configured actor patch RVA 0x%llX\n",
+                (unsigned long long)OFFSETS::ActorPatchRva);
+        } else {
+            printf("[ENTITY-SCAN] Configured actor MOV validation failed; using signature fallback\n");
+        }
+    }
+    for(auto& c:calls) if(!g_frameSyncAddr&&c.hasTestAlAl){g_frameSyncAddr=c.targetVA;break;}
     if(!g_frameSyncAddr&&!calls.empty()) g_frameSyncAddr=calls[0].targetVA;
     if(!g_frameSyncAddr) return false;
     KAllocRequest ar={}; ar.ProcessId=driver->ProcessId; ar.Size=8192;
@@ -452,13 +666,32 @@ static bool InitRenderPipeline(uint64_t base, uint64_t size) {
     if(!g_ShellPage) return false;
     g_RingAddr=g_ShellPage+0x100;
     FindRound();
-    g_projectionAddr=ScanForViewTrans(base,size);
-    if (ScanSkelXref(base)) {
-        printf("[R6] Skeleton xref: compIdx=+0x%X compArr=+0x%X func=0x%llX\n",
-            g_SkelXref.compIdxOff, g_SkelXref.compArrOff, (unsigned long long)g_SkelXref.skelFuncVA);
-    } else {
-        printf("[R6] Skeleton xref not found\n");
+    if (!g_pViewDataPtr && OFFSETS::ViewMatrixRva + sizeof(uint64_t) <= size) {
+        const uint64_t configuredViewPtr = base + OFFSETS::ViewMatrixRva;
+        if (IsValidAddr(read<uint64_t>(configuredViewPtr))) {
+            g_pViewDataPtr = configuredViewPtr;
+            printf("[W2S] Using configured view pointer RVA 0x%llX\n",
+                (unsigned long long)OFFSETS::ViewMatrixRva);
+        }
     }
+    RefreshConfiguredProjection();
+    if (!g_projectionAddr) g_projectionAddr=ScanForViewTrans(base,size);
+    if (ScanSkelXref(base)) {
+        printf("[R6] Skeleton hash function: func=0x%llX HEAD=0x%llX NECK=0x%llX pairs=%u\n",
+            (unsigned long long)g_SkelXref.skelFuncVA,
+            (unsigned long long)g_SkelXref.headHashRefVA,
+            (unsigned long long)g_SkelXref.neckHashRefVA,
+            g_SkelXref.pairCount);
+    } else {
+        printf("[R6] Skeleton hash function not found or ambiguous\n");
+    }
+
+    skel::g_readRotQuatFn = ReadSkeletonRotation;
+    skel::g_readPhysPosFn = ReadSkeletonAnchor;
+    g_registryScanThread = CreateThread(NULL, 0, [](LPVOID) -> DWORD {
+        skel::ScanRegistry();
+        return 0;
+    }, NULL, 0, NULL);
 
     CreateThread(NULL, 0, [](LPVOID) -> DWORD { ScanSidewards(); return 0; }, NULL, 0, NULL);
 
@@ -467,9 +700,15 @@ static bool InitRenderPipeline(uint64_t base, uint64_t size) {
 }
 
 static void ShutdownRenderPipeline() {
+    if (g_registryScanThread) {
+        if (WaitForSingleObject(g_registryScanThread, 2000) == WAIT_OBJECT_0)
+            CloseHandle(g_registryScanThread);
+        g_registryScanThread = NULL;
+    }
     RestoreSidewards();
     if(g_frameSyncActive) DetachFrameSync();
     FlushSyncBuffer();
+    skel::CloseLog();
     if(g_log){fclose(g_log);g_log=nullptr;}
 }
 
@@ -615,8 +854,18 @@ static void PollSyncBuffer(int W, int H, int maxD) {
             e.screenPos = sp;
             e.onScreen = on;
             e.hasBones = false;
+            e.headOnScreen = false;
             e.hp = 100;
             e.operatorName[0] = '\0';
+
+            if ((Esp_skeleton || skeletonAim) && e.isPlayer &&
+                ReadSkeleton(ea, draw_pos.x, draw_pos.y, draw_pos.z, e.bones) &&
+                e.bones.total > 0) {
+                e.hasBones = true;
+                const Vec3B head = GetHeadBonePos(e.bones);
+                const Vec3 headWorld = { head.x, head.y, head.z };
+                e.headOnScreen = W2S(headWorld, e.headScreenPos, W, H);
+            }
 
 
             const char* opName = ResolveShaderLabel(ea);
@@ -644,6 +893,7 @@ static void FlushOverlayPipeline(bool box, bool corner, bool line, bool dist, in
                             bool trail, bool aimEnabled, float aimFov, float aimSmooth,
                             int hitboxSel, bool fovCircle, bool squareFov, bool xhair) {
     int W = GetSystemMetrics(SM_CXSCREEN), H = GetSystemMetrics(SM_CYSCREEN);
+    CaptureProjectionFrame();
     PollSyncBuffer(W, H, visDist);
     std::lock_guard<std::mutex> lk(g_Mtx);
     ImDrawList* dl = ImGui::GetOverlayDrawList();
@@ -684,9 +934,12 @@ static void FlushOverlayPipeline(bool box, bool corner, bool line, bool dist, in
         ImU32 snapCol = GetSnaplineColor(entOffset);
 
         
-        Vec3 headPos = {e.position.x, e.position.y, e.position.z + k_viewportHeight};
-        Vec3 headScr = {};
-        bool headOn = W2S(headPos, headScr, W, H);
+        Vec3 headScr = e.headScreenPos;
+        bool headOn = e.hasBones && e.headOnScreen;
+        if (!headOn) {
+            const Vec3 headPos = {e.position.x, e.position.y, e.position.z + k_viewportHeight};
+            headOn = W2S(headPos, headScr, W, H);
+        }
 
         if (box && headOn) {
             float boxH = fabsf(sy - headScr.y);
@@ -727,6 +980,28 @@ static void FlushOverlayPipeline(bool box, bool corner, bool line, bool dist, in
 
         if (lineheadesp && headOn) {
             dl->AddLine({sx, sy}, {(float)headScr.x, (float)headScr.y}, IM_COL32(255,255,0,200), 1.0f);
+        }
+
+        if (Esp_skeleton && e.hasBones) {
+            const ImU32 skeletonColor = ColorToU32(espSkeletonColor);
+            const SkeletonBones& bones = e.bones;
+            auto drawBone = [&](int first, int second) {
+                if (!bones.hasBone[first] || !bones.hasBone[second]) return;
+                const Vec3 firstWorld = {
+                    bones.bones[first].x, bones.bones[first].y, bones.bones[first].z
+                };
+                const Vec3 secondWorld = {
+                    bones.bones[second].x, bones.bones[second].y, bones.bones[second].z
+                };
+                Vec3 firstScreen{}, secondScreen{};
+                if (W2S(firstWorld, firstScreen, W, H) && W2S(secondWorld, secondScreen, W, H)) {
+                    dl->AddLine({firstScreen.x, firstScreen.y},
+                        {secondScreen.x, secondScreen.y}, skeletonColor, skeletonThickness);
+                }
+            };
+            for (int i = 0; i < skel::kNumConnections; ++i) {
+                drawBone(skel::kConnections[i].first, skel::kConnections[i].second);
+            }
         }
 
         if (dist) {
@@ -852,10 +1127,19 @@ static void FlushOverlayPipeline(bool box, bool corner, bool line, bool dist, in
                     }
                 }
             } else {
-                AimTarget at = GetAimPosition(e.instance, (float)e.position.x, (float)e.position.y, (float)e.position.z, hitboxSel);
-                Vec3 aimWorld = {at.x, at.y, at.z};
                 Vec3 aimScr = {};
-                bool aimOn = W2S(aimWorld, aimScr, W, H);
+                bool aimOn = false;
+                if (skeletonAim) {
+                    if (e.hasBones && e.headOnScreen) {
+                        aimScr = e.headScreenPos;
+                        aimOn = true;
+                    }
+                } else {
+                    AimTarget at = GetAimPosition(e.instance, (float)e.position.x,
+                        (float)e.position.y, (float)e.position.z, hitboxSel);
+                    const Vec3 aimWorld = {at.x, at.y, at.z};
+                    aimOn = W2S(aimWorld, aimScr, W, H);
+                }
                 if (aimOn) {
                     float dx = (float)aimScr.x - W / 2.0f;
                     float dy = (float)aimScr.y - H / 2.0f;
