@@ -32,6 +32,16 @@ static size_t ScanBufFirst(const uint8_t* buf, size_t sz, const std::vector<int>
     return SIZE_MAX;
 }
 
+static bool PatternMatchesAt(const uint8_t* buf, size_t sz, size_t offset,
+    const std::vector<int>& pat) {
+    if (!buf || pat.empty() || offset > sz || pat.size() > sz - offset) return false;
+    for (size_t i = 0; i < pat.size(); ++i) {
+        if (pat[i] != -1 && buf[offset + i] != static_cast<uint8_t>(pat[i]))
+            return false;
+    }
+    return true;
+}
+
 struct TextSectionCache {
     std::vector<uint8_t> data;
     uint64_t textBase = 0, textSize = 0;
@@ -67,6 +77,8 @@ static uint64_t ScanSigRipRelative(const char* pattern, int instructionOffset,
 static uint64_t g_pGameManagerPtr = 0;
 static uint64_t g_pViewDataPtr = 0;
 static uint64_t g_pCameraManagerPtr = 0;
+static uint64_t g_pInGameFlag = 0;
+static uint64_t g_actorCaller = 0;
 
 static void ScanConfiguredPointers(uint64_t moduleBase) {
     g_pGameManagerPtr = ScanSigRipRelative(
@@ -79,10 +91,22 @@ static void ScanConfiguredPointers(uint64_t moduleBase) {
         g_pCameraManagerPtr = ScanSigRipRelative(
             OFFSETS::CameraTwoSignature, 0, moduleBase);
     }
-    printf("[SIG] GameManager=0x%llX ViewData=0x%llX CameraManager=0x%llX\n",
+    g_pInGameFlag = ScanSigRipRelative(OFFSETS::InGameFlagSignature,
+        OFFSETS::InGameFlagInstructionOffset, moduleBase);
+
+    const auto actorCallerPattern = ParsePattern(OFFSETS::ActorCallerSignature);
+    const size_t actorCallerMatch = ScanBufFirst(g_textCache.data.data(),
+        g_textCache.data.size(), actorCallerPattern);
+    if (actorCallerMatch != SIZE_MAX)
+        g_actorCaller = g_textCache.textBase + actorCallerMatch;
+
+    printf("[SIG] GameManager=0x%llX ViewData=0x%llX CameraManager=0x%llX "
+           "InGameFlag=0x%llX ActorCaller=0x%llX\n",
         (unsigned long long)g_pGameManagerPtr,
         (unsigned long long)g_pViewDataPtr,
-        (unsigned long long)g_pCameraManagerPtr);
+        (unsigned long long)g_pCameraManagerPtr,
+        (unsigned long long)g_pInGameFlag,
+        (unsigned long long)g_actorCaller);
 }
 
 struct PESection { char name[9]; uint64_t va, vsz; };
@@ -131,13 +155,11 @@ static std::vector<CallTarget> FindEntityFunctionCalls(uint64_t moduleBase) {
     const uint8_t* t = g_textCache.data.data();
     size_t sz = (size_t)g_textCache.textSize;
     uint64_t tb = g_textCache.textBase;
-    const uint8_t anc[] = {0xC7,0x05,0x00,0x00,0x01};
-    printf("[ENTITY-SCAN] Scanning %zu bytes for anchor C7 05 00 00 01...\n", sz);
+    const auto anchorPattern = ParsePattern(OFFSETS::EntityFunctionCallsSignature);
+    printf("[ENTITY-SCAN] Scanning %zu bytes for configured entity-call anchor...\n", sz);
     int anchors = 0;
-    for (size_t i = 0; i+5 <= sz; i++) {
-        bool m = true;
-        for (int j=0;j<5;j++) if(t[i+j]!=anc[j]){m=false;break;}
-        if (!m) continue;
+    for (size_t i = 0; i + anchorPattern.size() <= sz; i++) {
+        if (!PatternMatchesAt(t, sz, i, anchorPattern)) continue;
         anchors++;
         uint64_t aVA = tb + i;
         if (anchors<=5) printf("[ENTITY-SCAN]   Anchor #%d VA=0x%llX (RVA=0x%llX)\n",

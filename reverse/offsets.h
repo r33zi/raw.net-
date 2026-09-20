@@ -33,6 +33,20 @@ namespace OFFSETS
         "48 8B 0D ?? ?? ?? ?? 48 8B 01 FF 90 D8 00 00 00 F3 0F 10";
     static constexpr const char* GameManagerSignature =
         "48 8B 0D ?? ?? ?? ?? 48 85 C9 0F 84 ?? ?? ?? ?? 48 8B 01 FF 90";
+    static constexpr const char* PositionSignature =
+        "00 00 00 00 00 00 00 00 00 00 80 3F 00 00 00 00 "
+        "?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 00 00 00 00 "
+        "9D 99 99 3E 00 00 00 00 00 00 00 00";
+    static constexpr uintptr_t PositionXOffset = 0x10;
+    static constexpr uintptr_t PositionYOffset = 0x14;
+    static constexpr uintptr_t PositionZOffset = 0x18;
+    static constexpr const char* InGameFlagSignature =
+        "F6 C1 07 45 0F B6 ?? 45 0F 44 ?? 41 83 E2 01 44 89 15 ?? ?? ?? ??";
+    static constexpr int InGameFlagInstructionOffset = 15;
+    static constexpr const char* ActorCallerSignature =
+        "65 ?? 8B ?? 25 58 00 00 00 ?? 8B ?? ?? ?? 8D ?? ?? ?? ?? 00 ?? C1 ?? 03";
+    static constexpr const char* EntityFunctionCallsSignature =
+        "C7 05 ?? ?? ?? ?? 01 00 00 00";
     static constexpr const char* EntitySignature =
         "FF 91 E0 00 00 00 8B B8 10 01 00 00";
     static constexpr const char* ViewMatrixSignature =
