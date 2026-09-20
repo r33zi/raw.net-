@@ -51,6 +51,8 @@ bool rainbowBox = false;
 bool rainbowTrail = false;
 bool rainbowFov = false;
 bool rainbowSnaplines = false;
+bool Esp_skeleton = false;
+bool skeletonAim = false;
 
 float espBoxColor[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
 float espSnaplineColor[4] = { 1.0f, 1.0f, 0.0f, 1.0f };
@@ -60,6 +62,7 @@ float fovCircleColor[4] = { 1.0f, 1.0f, 1.0f, 0.7f };
 float crosshairColor[4] = { 0.0f, 1.0f, 0.0f, 1.0f };
 float aimbotTargetColor[4] = { 1.0f, 0.0f, 1.0f, 1.0f };
 float filledBoxColor[4] = { 1.0f, 0.0f, 0.0f, 0.15f };
+float espSkeletonColor[4] = { 1.0f, 1.0f, 1.0f, 0.85f };
 
 float boxThickness = 1.5f;
 float snaplineThickness = 1.0f;
@@ -67,6 +70,7 @@ float trailThickness = 1.5f;
 int trailLength = 60;
 float fovCircleThickness = 1.0f;
 float crosshairSize = 8.0f;
+float skeletonThickness = 1.5f;
 bool sidewardsEnabled = false;
 float sidewardsValue = 10.0f;
 bool shaderLabelOverlay = false;
@@ -624,6 +628,18 @@ void render() {
             if (fillbox) {
                 ImGui::ColorEdit4("Fill Color", filledBoxColor, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar);
             }
+
+            ImGui::Separator();
+            ImGui::Text("Skeleton ESP");
+            ImGui::Checkbox("Enable Skeleton", &Esp_skeleton);
+            ImGui::SameLine();
+            ImGui::Checkbox("Aim at Head Bone", &skeletonAim);
+            ImGui::ColorEdit4("Skeleton Color", espSkeletonColor,
+                ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar);
+            ImGui::SameLine();
+            ImGui::PushItemWidth(160.0f);
+            ImGui::SliderFloat("Thickness##skeleton", &skeletonThickness, 0.5f, 5.0f, "%.1f");
+            ImGui::PopItemWidth();
 
             
             ImGui::Separator();

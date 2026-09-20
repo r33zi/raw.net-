@@ -1,10 +1,12 @@
 #pragma once
 
 #include <windows.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <vector>
 #include "driver.h"
+#include "offsets.h"
 
 static std::vector<int> ParsePattern(const char* pat) {
     std::vector<int> v;
@@ -36,6 +38,52 @@ struct TextSectionCache {
     bool valid = false;
 };
 static TextSectionCache g_textCache;
+
+// Resolve the pointer variable referenced by a seven-byte RIP-relative load
+// at the requested offset within a configured signature match.
+static uint64_t ScanSigRipRelative(const char* pattern, int instructionOffset,
+    uint64_t moduleBase) {
+    if (!g_textCache.valid || !pattern || instructionOffset < 0) return 0;
+    const auto parsed = ParsePattern(pattern);
+    const size_t match = ScanBufFirst(g_textCache.data.data(),
+        g_textCache.data.size(), parsed);
+    if (match == SIZE_MAX) return 0;
+
+    const size_t instruction = match + (size_t)instructionOffset;
+    if (instruction > g_textCache.data.size() ||
+        g_textCache.data.size() - instruction < 7) return 0;
+
+    int32_t displacement = 0;
+    memcpy(&displacement, g_textCache.data.data() + instruction + 3,
+        sizeof(displacement));
+    const uint64_t instructionEnd = g_textCache.textBase + instruction + 7;
+    const uint64_t pointerAddress = instructionEnd + displacement;
+    printf("[SIG] match RVA=0x%llX -> pointer=0x%llX\n",
+        (unsigned long long)(g_textCache.textBase + match - moduleBase),
+        (unsigned long long)pointerAddress);
+    return pointerAddress;
+}
+
+static uint64_t g_pGameManagerPtr = 0;
+static uint64_t g_pViewDataPtr = 0;
+static uint64_t g_pCameraManagerPtr = 0;
+
+static void ScanConfiguredPointers(uint64_t moduleBase) {
+    g_pGameManagerPtr = ScanSigRipRelative(
+        OFFSETS::GameManagerSignature, 0, moduleBase);
+    g_pViewDataPtr = ScanSigRipRelative(
+        OFFSETS::ViewMatrixSignature, 0, moduleBase);
+    g_pCameraManagerPtr = ScanSigRipRelative(
+        OFFSETS::CameraOneSignature, 0, moduleBase);
+    if (!g_pCameraManagerPtr) {
+        g_pCameraManagerPtr = ScanSigRipRelative(
+            OFFSETS::CameraTwoSignature, 0, moduleBase);
+    }
+    printf("[SIG] GameManager=0x%llX ViewData=0x%llX CameraManager=0x%llX\n",
+        (unsigned long long)g_pGameManagerPtr,
+        (unsigned long long)g_pViewDataPtr,
+        (unsigned long long)g_pCameraManagerPtr);
+}
 
 struct PESection { char name[9]; uint64_t va, vsz; };
 
@@ -117,10 +165,7 @@ static std::vector<CallTarget> FindEntityFunctionCalls(uint64_t moduleBase) {
 
 static uint64_t ScanForViewTrans(uint64_t moduleBase, uint64_t moduleSize) {
     printf("[W2S] Scanning PAGE_READWRITE regions for ViewTranslation...\n");
-    static const auto pat = ParsePattern(
-        "A4 70 7D BF 00 00 00 00 00 00 00 00 00 00 A0 40 "
-        "00 00 A0 C0 00 00 00 00 00 00 00 00 CD CC 4C 3F "
-        "00 00 00 3F 00 00 80 3E");
+    static const auto pat = ParsePattern(OFFSETS::ViewAnchorSignature);
     extern DWORD processID;
     HANDLE hP = OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ, FALSE, processID);
     if (!hP) { printf("[W2S] OpenProcess failed\n"); return 0; }
@@ -162,11 +207,16 @@ static uint64_t ScanForViewTrans(uint64_t moduleBase, uint64_t moduleSize) {
 
 struct SkelXrefInfo {
     uint64_t skelFuncVA;
-    uint32_t compIdxOff;
-    uint32_t compArrOff;
+    uint64_t headHashRefVA;
+    uint64_t neckHashRefVA;
+    uint32_t pairCount;
     bool valid;
 };
 static SkelXrefInfo g_SkelXref = {};
+
+static constexpr uint32_t HEAD_BONE_HASH = 0x07C159A2;
+static constexpr uint32_t NECK_BONE_HASH = 0x8023796D;
+static constexpr size_t BONE_HASH_PAIR_MAX_DIST = 0x100;
 
 struct RtFunc { uint32_t begin, end, unwind; };
 static std::vector<RtFunc> g_pdataEntries;
@@ -175,23 +225,29 @@ static bool g_pdataLoaded = false;
 static bool LoadPdata(uint64_t base) {
     if (g_pdataLoaded) return !g_pdataEntries.empty();
     g_pdataLoaded = true;
-    IMAGE_DOS_HEADER dos={}; driver->ReadProcessMemory(base, &dos, sizeof(dos));
+    IMAGE_DOS_HEADER dos={};
+    if (driver->ReadProcessMemory(base, &dos, sizeof(dos)) != 0) return false;
     if (dos.e_magic != 0x5A4D) return false;
-    IMAGE_NT_HEADERS64 nt={}; driver->ReadProcessMemory(base+dos.e_lfanew, &nt, sizeof(nt));
+    IMAGE_NT_HEADERS64 nt={};
+    if (driver->ReadProcessMemory(base+dos.e_lfanew, &nt, sizeof(nt)) != 0) return false;
     if (nt.Signature != 0x4550) return false;
     uint32_t pdataRVA = nt.OptionalHeader.DataDirectory[3].VirtualAddress;
     uint32_t pdataSize = nt.OptionalHeader.DataDirectory[3].Size;
-    if (!pdataRVA || !pdataSize) return false;
-    int count = pdataSize / 12;
+    if (!pdataRVA || !pdataSize || pdataSize % sizeof(RtFunc) != 0) return false;
+    size_t count = pdataSize / sizeof(RtFunc);
     g_pdataEntries.resize(count);
     const size_t CHUNK = 0x100000;
     size_t done = 0;
     while (done < (size_t)pdataSize) {
         size_t rd = pdataSize - done; if (rd > CHUNK) rd = CHUNK;
-        driver->ReadProcessMemory(base + pdataRVA + done, ((uint8_t*)g_pdataEntries.data()) + done, (uint32_t)rd);
+        if (driver->ReadProcessMemory(base + pdataRVA + done,
+            ((uint8_t*)g_pdataEntries.data()) + done, (uint32_t)rd) != 0) {
+            g_pdataEntries.clear();
+            return false;
+        }
         done += rd;
     }
-    printf("[SKEL-SCAN] Loaded %d .pdata entries\n", count);
+    printf("[SKEL-SCAN] Loaded %zu .pdata entries\n", count);
     return true;
 }
 
@@ -211,119 +267,104 @@ static bool LookupFuncBounds(uint64_t moduleBase, uint32_t rva, uint32_t& outBeg
     return false;
 }
 
+static std::vector<size_t> FindImm32Refs(const uint8_t* text, size_t textSize, uint32_t target) {
+    std::vector<size_t> hits;
+    if (!text || textSize < sizeof(target)) return hits;
+
+    for (size_t i = 0; i + sizeof(target) <= textSize; ++i) {
+        uint32_t value = 0;
+        memcpy(&value, text + i, sizeof(value));
+        if (value == target) hits.push_back(i);
+    }
+    return hits;
+}
+
+struct SkelHashCandidate {
+    uint32_t funcBeginRVA;
+    uint32_t funcEndRVA;
+    size_t headRefOffset;
+    size_t neckRefOffset;
+    uint32_t pairCount;
+};
+
 static bool ScanSkelXref(uint64_t moduleBase) {
-    if (!g_textCache.valid) return false;
-    const uint8_t* t = g_textCache.data.data();
-    size_t sz = (size_t)g_textCache.textSize;
-    uint64_t tb = g_textCache.textBase;
-    LoadPdata(moduleBase);
-    printf("[SKEL-SCAN] Scanning %zu bytes for skeleton xref (v2)...\n", sz);
-    int candidates = 0;
-    for (size_t i = 16; i + 50 < sz; i++) {
-        if (t[i] != 0x48 || t[i+1] != 0x85 || t[i+2] != 0xC9) continue;
-        int afterTest = (int)i + 3;
-        if (t[afterTest] != 0x74 && !(t[afterTest] == 0x0F && t[afterTest+1] == 0x84)) continue;
-        bool foundScale8 = false;
-        int scale8End = -1;
-        int scale8Pos = -1;
-        for (int back = 4; back <= 10; back++) {
-            int pos = (int)i - back;
-            if (pos < 1) continue;
-            if ((t[pos] & 0xF0) == 0x40 && t[pos+1] == 0x8B && (t[pos+2] & 0xC7) == 0x04) {
-                uint8_t sib = t[pos+3];
-                if ((sib & 0xC0) == 0xC0) {
-                    foundScale8 = true;
-                    scale8End = pos + 4;
-                    scale8Pos = pos;
-                    break;
-                }
+    g_SkelXref = {};
+    if (!g_textCache.valid || !LoadPdata(moduleBase)) return false;
+
+    const uint8_t* text = g_textCache.data.data();
+    const size_t textSize = g_textCache.data.size();
+    const uint64_t textBase = g_textCache.textBase;
+    const auto headRefs = FindImm32Refs(text, textSize, HEAD_BONE_HASH);
+    const auto neckRefs = FindImm32Refs(text, textSize, NECK_BONE_HASH);
+
+    printf("[SKEL-SCAN] HEAD hash 0x%08X: %zu hit(s)\n", HEAD_BONE_HASH, headRefs.size());
+    printf("[SKEL-SCAN] NECK hash 0x%08X: %zu hit(s)\n", NECK_BONE_HASH, neckRefs.size());
+
+    std::vector<SkelHashCandidate> candidates;
+    for (size_t headOffset : headRefs) {
+        const size_t pairLo = headOffset > BONE_HASH_PAIR_MAX_DIST
+            ? headOffset - BONE_HASH_PAIR_MAX_DIST : 0;
+        const size_t remaining = textSize - 1 - headOffset;
+        const size_t pairHi = remaining < BONE_HASH_PAIR_MAX_DIST
+            ? textSize - 1 : headOffset + BONE_HASH_PAIR_MAX_DIST;
+        auto neckIt = std::lower_bound(neckRefs.begin(), neckRefs.end(), pairLo);
+
+        for (; neckIt != neckRefs.end() && *neckIt <= pairHi; ++neckIt) {
+            const uint64_t headVA = textBase + headOffset;
+            const uint64_t neckVA = textBase + *neckIt;
+            if (headVA < moduleBase || neckVA < moduleBase) continue;
+
+            const uint64_t headRVA64 = headVA - moduleBase;
+            const uint64_t neckRVA64 = neckVA - moduleBase;
+            if (headRVA64 > UINT32_MAX || neckRVA64 > UINT32_MAX) continue;
+
+            uint32_t headBegin = 0, headEnd = 0;
+            uint32_t neckBegin = 0, neckEnd = 0;
+            if (!LookupFuncBounds(moduleBase, (uint32_t)headRVA64, headBegin, headEnd) ||
+                !LookupFuncBounds(moduleBase, (uint32_t)neckRVA64, neckBegin, neckEnd) ||
+                headBegin != neckBegin || headEnd != neckEnd) {
+                continue;
+            }
+
+            auto candidateIt = std::find_if(candidates.begin(), candidates.end(),
+                [headBegin](const SkelHashCandidate& candidate) {
+                    return candidate.funcBeginRVA == headBegin;
+                });
+            if (candidateIt == candidates.end()) {
+                candidates.push_back({headBegin, headEnd, headOffset, *neckIt, 1});
+            } else {
+                ++candidateIt->pairCount;
             }
         }
-        if (!foundScale8) continue;
-        int jzSkip = 2;
-        if (t[afterTest] == 0x0F) jzSkip = 6;
-        int callPos = -1;
-        for (int j = afterTest + jzSkip; j < afterTest + 40 && j + 5 < (int)sz; j++) {
-            if (t[j] == 0xE8) {
-                int32_t rel = *(int32_t*)&t[j+1];
-                uint64_t target = tb + j + 5 + (int64_t)rel;
-                if (target < moduleBase || target > moduleBase + 0x20000000) continue;
-                uint32_t targetRVA = (uint32_t)(target - moduleBase);
-                uint32_t fb = 0, fe = 0;
-                bool hasBounds = LookupFuncBounds(moduleBase, targetRVA, fb, fe);
-                uint32_t funcSize = hasBounds ? (fe - fb) : 0;
-                if (hasBounds && funcSize < 0x500) continue;
-                callPos = j;
-                break;
-            }
-        }
-        if (callPos < 0) continue;
-        uint32_t compIdxOff = 0;
-        bool foundIdx = false;
-        int searchBack = (int)scale8Pos - 30;
-        if (searchBack < 1) searchBack = 1;
-        for (int j = searchBack; j < scale8Pos; j++) {
-            if (t[j] != 0x0F || t[j+1] != 0xB6) continue;
-            int mpos = j + 2;
-            uint8_t modrm = t[mpos];
-            uint8_t mod = (modrm >> 6) & 3;
-            uint8_t rm = modrm & 7;
-            if (mod != 2) continue;
-            int dpos = mpos + 1;
-            if (rm == 4) dpos++;
-            if (dpos + 4 > (int)sz) continue;
-            uint32_t off = *(uint32_t*)&t[dpos];
-            if (off >= 0x100 && off <= 0x2FF) {
-                compIdxOff = off;
-                foundIdx = true;
-                break;
-            }
-        }
-        if (!foundIdx) continue;
-        uint32_t compArrOff = 0;
-        bool foundArr = false;
-        for (int j = searchBack; j < scale8Pos; j++) {
-            if (!((t[j] & 0xF0) == 0x40 && (t[j] & 0x08))) continue;
-            if (t[j+1] != 0x8B) continue;
-            uint8_t modrm = t[j+2];
-            if ((modrm & 0xC7) == 0x04) continue;
-            uint8_t mod = (modrm >> 6) & 3;
-            uint8_t rm = modrm & 7;
-            if (mod != 2) continue;
-            int dpos = j + 3;
-            if (rm == 4) dpos++;
-            if (dpos + 4 > (int)sz) continue;
-            uint32_t off = *(uint32_t*)&t[dpos];
-            if (off >= 0x40 && off <= 0x200 && off != compIdxOff) {
-                compArrOff = off;
-                foundArr = true;
-                break;
-            }
-        }
-        if (!foundArr) continue;
-        int32_t callRel = *(int32_t*)&t[callPos+1];
-        uint64_t skelFunc = tb + callPos + 5 + (int64_t)callRel;
-        uint32_t skelRVA = (uint32_t)(skelFunc - moduleBase);
-        uint32_t fb2=0, fe2=0;
-        bool hb2 = LookupFuncBounds(moduleBase, skelRVA, fb2, fe2);
-        candidates++;
-        printf("[SKEL-SCAN] #%d: compIdx=+0x%X compArr=+0x%X skel=RVA 0x%X",
-            candidates, compIdxOff, compArrOff, skelRVA);
-        if (hb2) printf(" funcSz=0x%X", fe2-fb2);
-        printf(" xref=RVA 0x%llX\n", (unsigned long long)(tb + i - moduleBase));
-        g_SkelXref.skelFuncVA = skelFunc;
-        g_SkelXref.compIdxOff = compIdxOff;
-        g_SkelXref.compArrOff = compArrOff;
-        g_SkelXref.valid = true;
-        break;
     }
-    if (g_SkelXref.valid) {
-        printf("[SKEL-SCAN] FOUND: compIdx=+0x%X compArr=+0x%X skelFunc=0x%llX\n",
-            g_SkelXref.compIdxOff, g_SkelXref.compArrOff, (unsigned long long)g_SkelXref.skelFuncVA);
-    } else {
-        printf("[SKEL-SCAN] NOT FOUND (%d candidates checked)\n", candidates);
+
+    printf("[SKEL-SCAN] %zu function candidate(s) contain a HEAD/NECK pair within 0x%zX bytes\n",
+        candidates.size(), BONE_HASH_PAIR_MAX_DIST);
+    for (const auto& candidate : candidates) {
+        printf("[SKEL-SCAN]   func=RVA 0x%X HEAD=RVA 0x%llX NECK=RVA 0x%llX pairs=%u\n",
+            candidate.funcBeginRVA,
+            (unsigned long long)(textBase + candidate.headRefOffset - moduleBase),
+            (unsigned long long)(textBase + candidate.neckRefOffset - moduleBase),
+            candidate.pairCount);
     }
-    return g_SkelXref.valid;
+
+    if (candidates.size() != 1) {
+        printf("[SKEL-SCAN] NOT FOUND: expected one hash-pair function, got %zu\n", candidates.size());
+        return false;
+    }
+
+    const auto& candidate = candidates.front();
+    g_SkelXref.skelFuncVA = moduleBase + candidate.funcBeginRVA;
+    g_SkelXref.headHashRefVA = textBase + candidate.headRefOffset;
+    g_SkelXref.neckHashRefVA = textBase + candidate.neckRefOffset;
+    g_SkelXref.pairCount = candidate.pairCount;
+    g_SkelXref.valid = true;
+    printf("[SKEL-SCAN] FOUND: func=0x%llX HEAD=0x%llX NECK=0x%llX pairs=%u\n",
+        (unsigned long long)g_SkelXref.skelFuncVA,
+        (unsigned long long)g_SkelXref.headHashRefVA,
+        (unsigned long long)g_SkelXref.neckHashRefVA,
+        g_SkelXref.pairCount);
+    return true;
 }
 
 struct SidewardsInfo {

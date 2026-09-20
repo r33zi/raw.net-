@@ -34,7 +34,11 @@
       <Filter>Driver</Filter>
     </ClInclude>
     <ClInclude Include="r6_entities.h" />
+    <ClInclude Include="r6_bone_ids.h" />
+    <ClInclude Include="r6_bones.h" />
     <ClInclude Include="r6_scanner.h" />
+    <ClInclude Include="skel.h" />
+    <ClInclude Include="skel_autodiscover.h" />
     <ClInclude Include="antitamper.h" />
     <ClInclude Include="skeleton_emu.h" />
   </ItemGroup>
