@@ -279,7 +279,10 @@ static uint64_t g_RoundPtr = 0;
 static bool g_RoundFound = false;
 
 static DWORD g_lastEntityUpdate = 0;
-static constexpr DWORD ENTITY_UPDATE_INTERVAL = 0;
+// Keep costly driver reads and skeleton reconstruction off the render cadence.
+// The overlay (including the menu) still renders at the presentation rate while
+// entity data is refreshed often enough for smooth interpolation.
+static constexpr DWORD ENTITY_UPDATE_INTERVAL = 33;
 
 
 static std::unordered_map<uint64_t, RenderSyncEntry> g_syncMap;
