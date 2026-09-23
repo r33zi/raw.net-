@@ -109,32 +109,14 @@ static inline void TransformBone(float& x, float& y, float& z,
 }
 
 // ═══ POSITION ANCHOR ═══
-// draw_pos (from the encrypted actor chain / +0x50) is the character's FEET.
-// The PhysicsWorld position on the char comp (auto-discovered by
-// FindPhysWorldOffset) is the character's root/pelvis — the same origin the
-// palette bones are centered on. When we can read it, it's a much better
-// anchor for rig-local skeletons than draw_pos: it removes the feet-vs-pelvis
-// vertical offset that put skeletons above or below the player model.
-//
-// Returns the physics-world position if available, otherwise falls back to
-// the supplied draw_pos. Also returns whether we used physics (so callers
-// know whether to apply the feet-alignment min_z lift).
+// Use the verified paired position. Keep feet alignment enabled: the component
+// no longer exposes an independently verified pelvis/root transform.
 struct AnchorPos { float x, y, z; bool fromPhysics; };
 
 static inline AnchorPos ResolveAnchor(uint64_t entity, float wx, float wy, float wz)
 {
-    AnchorPos a{ wx, wy, wz, false };
-    if (!skel::ValidPtr(entity)) return a;
-    uint64_t comp = 0;
-    if (skel::g_componentArrayOffset)
-        comp = skel::FindCharacterComponent(entity);
-    if (!comp) return a;
-    Vec3 phys{};
-    if (GetPhysWorldPos(comp, phys) && ValidateWorldCoord(phys)) {
-        a.x = phys.x; a.y = phys.y; a.z = phys.z;
-        a.fromPhysics = true;
-    }
-    return a;
+    (void)entity;
+    return { wx, wy, wz, false };
 }
 
 // PATH A: resolve palette by aligning palette against entity world position.

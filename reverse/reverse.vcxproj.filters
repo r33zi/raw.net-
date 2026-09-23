@@ -34,6 +34,7 @@
       <Filter>Driver</Filter>
     </ClInclude>
     <ClInclude Include="r6_entities.h" />
+    <ClInclude Include="frame_position.h" />
     <ClInclude Include="r6_bone_ids.h" />
     <ClInclude Include="r6_bones.h" />
     <ClInclude Include="r6_scanner.h" />

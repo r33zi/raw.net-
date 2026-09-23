@@ -8,15 +8,11 @@ namespace OFFSETS
     // module base is always used so ASLR cannot invalidate a captured base.
     static constexpr uintptr_t DumpGameBase = 0x7FF66C070000ULL;
 
-    static constexpr uintptr_t ActorPatchRva = 0x00CFCE5B;
     static constexpr uintptr_t CameraPatchRva = 0x0E6A4795;
     static constexpr uintptr_t CodeCaveOneRva = 0x10D73294;
     static constexpr uintptr_t CodeCaveTwoRva = 0x10D78DF4;
 
     static constexpr uintptr_t ActorTrampolineRva = 0x000080D2;
-    static constexpr uintptr_t ActorMovRva = 0x00CFCE57;
-    static constexpr uint8_t ActorMovBytes[] = { 0x48, 0x89, 0x15 };
-    static constexpr bool ActorPatternIsTypeA = true;
 
     static constexpr uintptr_t CameraMovRva = 0x0E6A4779;
     static constexpr uintptr_t CameraTrampolineRva = 0x00052192;
@@ -31,8 +27,6 @@ namespace OFFSETS
         "48 8B 0D ?? ?? ?? ?? 4C 8B 01 41 FF 90 D8 00 00 00 F3 0F 10";
     static constexpr const char* CameraTwoSignature =
         "48 8B 0D ?? ?? ?? ?? 48 8B 01 FF 90 D8 00 00 00 F3 0F 10";
-    static constexpr const char* GameManagerSignature =
-        "48 8B 0D ?? ?? ?? ?? 48 85 C9 0F 84 ?? ?? ?? ?? 48 8B 01 FF 90";
     static constexpr const char* PositionSignature =
         "00 00 00 00 00 00 00 00 00 00 80 3F 00 00 00 00 "
         "?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 00 00 00 00 "
@@ -46,7 +40,7 @@ namespace OFFSETS
     static constexpr const char* ActorCallerSignature =
         "65 ?? 8B ?? 25 58 00 00 00 ?? 8B ?? ?? ?? 8D ?? ?? ?? ?? 00 ?? C1 ?? 03";
     static constexpr const char* EntityFunctionCallsSignature =
-        "C7 05 ?? ?? ?? ?? 01 00 00 00";
+        "C7 05 ?? ?? ?? ?? 00 00 01 00";
     static constexpr const char* EntitySignature =
         "FF 91 E0 00 00 00 8B B8 10 01 00 00";
     static constexpr const char* ViewMatrixSignature =

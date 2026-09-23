@@ -860,7 +860,8 @@ void render() {
 
             ImGui::Separator();
             if (ImGui::Button("Rescan Entities", ImVec2(200, 25))) {
-                g_syncComplete = false;
+                g_nextArmTick = 0;
+                g_fallbackArray = 0;
                 { std::lock_guard<std::mutex> l(g_frameMtx); g_capturedFrames.clear(); }
                 FlushSyncBuffer();
             }
