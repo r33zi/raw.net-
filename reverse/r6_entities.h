@@ -11,7 +11,12 @@
 #include <mutex>
 #include <atomic>
 #include <chrono>
+#include "frame_position.h"
 struct Vec3 { float x, y, z; };
+static uint64_t g_imageBase = 0;
+static uint64_t g_imageSize = 0;
+static framepos::Tracker g_positionTracker;
+static std::mutex g_positionTrackerMtx;
 
 #include "driver.h"
 #include "r6_scanner.h"
@@ -24,73 +29,9 @@ enum class ActorStatus { VALID, DEAD_1, DEAD_2, TEAM, LOCAL, INVALID };
 
 static bool IsValidAddr(uint64_t p){return p>0x10000ULL&&p<0x7FFFFFFFFFFFULL;}
 
-static bool ValidateWorldCoord(Vec3 v){
-    if (!std::isfinite(v.x) || !std::isfinite(v.y) || !std::isfinite(v.z))
-        return false;
-    if(fabsf(v.x)>=500000.f||fabsf(v.y)>=500000.f||fabsf(v.z)>=500000.f)
-        return false;
-    int s=(fabsf(v.x)>2.f?1:0)+(fabsf(v.y)>2.f?1:0)+(fabsf(v.z)>2.f?1:0);
-    return s>=2;
-}
+static bool ValidateWorldCoord(Vec3 v){ return framepos::Valid({v.x, v.y, v.z}); }
 
-// Character-component transform fields drift between game builds. Resolve
-// the physics anchor from the live +0xB00 position and discover the rotation
-// quaternion from the small set of layouts observed by the animation reader.
-static std::atomic<uint32_t> g_physWorldOff{0};
 static std::atomic<uint32_t> g_rotQuatOff{0};
-static std::mutex g_physWorldDiscoveryMtx;
-static uint32_t g_physWorldCandidateOff = 0;
-static Vec3 g_physWorldCandidateLive{};
-static uint32_t g_physWorldCandidateConfirmations = 0;
-
-static bool FindPhysWorldOffset(uint64_t component) {
-    if (g_physWorldOff.load(std::memory_order_acquire)) return true;
-    if (!IsValidAddr(component)) return false;
-
-    Vec3 live{};
-    if (driver->ReadProcessMemory(component + 0xB00, &live, sizeof(live)) != 0 ||
-        !ValidateWorldCoord(live)) return false;
-
-    float bestDistanceSq = FLT_MAX;
-    uint32_t bestOffset = 0;
-    for (uint32_t offset = 0x80; offset + sizeof(Vec3) <= 0x2F0; offset += 4) {
-        Vec3 candidate{};
-        if (driver->ReadProcessMemory(component + offset, &candidate, sizeof(candidate)) != 0)
-            continue;
-        if (!ValidateWorldCoord(candidate)) continue;
-        const float dx = candidate.x - live.x;
-        const float dy = candidate.y - live.y;
-        const float dz = candidate.z - live.z;
-        const float distanceSq = dx * dx + dy * dy + dz * dz;
-        if (distanceSq < bestDistanceSq) {
-            bestDistanceSq = distanceSq;
-            bestOffset = offset;
-        }
-    }
-    if (!bestOffset || bestDistanceSq > 9.0f) return false;
-    std::lock_guard<std::mutex> lock(g_physWorldDiscoveryMtx);
-    if (g_physWorldOff.load(std::memory_order_acquire)) return true;
-
-    const float moveX = live.x - g_physWorldCandidateLive.x;
-    const float moveY = live.y - g_physWorldCandidateLive.y;
-    const float moveZ = live.z - g_physWorldCandidateLive.z;
-    const float movementSq = moveX * moveX + moveY * moveY + moveZ * moveZ;
-    if (g_physWorldCandidateOff != bestOffset) {
-        g_physWorldCandidateOff = bestOffset;
-        g_physWorldCandidateLive = live;
-        g_physWorldCandidateConfirmations = 1;
-        return false;
-    }
-    if (movementSq < 0.01f) return false;
-
-    g_physWorldCandidateLive = live;
-    if (++g_physWorldCandidateConfirmations >= 2) {
-        g_physWorldOff.store(bestOffset, std::memory_order_release);
-        printf("[SKEL] Physics anchor offset: +0x%X\n", bestOffset);
-        return true;
-    }
-    return false;
-}
 
 static bool FindRotQuatOffset(uint64_t component) {
     if (g_rotQuatOff.load(std::memory_order_acquire)) return true;
@@ -133,50 +74,17 @@ static bool GetEntityRotQuat(uint64_t component, float* out) {
 }
 
 static bool GetPhysWorldPos(uint64_t component, Vec3& out) {
-    Vec3 live{};
-    if (driver->ReadProcessMemory(component + 0xB00, &live, sizeof(live)) != 0 ||
-        !ValidateWorldCoord(live)) return false;
-
-    uint32_t offset = g_physWorldOff.load(std::memory_order_acquire);
-    if (offset) {
-        Vec3 candidate{};
-        if (driver->ReadProcessMemory(component + offset, &candidate, sizeof(candidate)) == 0 &&
-            ValidateWorldCoord(candidate)) {
-            const float dx = candidate.x - live.x;
-            const float dy = candidate.y - live.y;
-            const float dz = candidate.z - live.z;
-            if (dx * dx + dy * dy + dz * dz <= 9.0f) {
-                out = candidate;
-                return true;
-            }
-        }
-        std::lock_guard<std::mutex> lock(g_physWorldDiscoveryMtx);
-        uint32_t staleOffset = offset;
-        if (g_physWorldOff.compare_exchange_strong(staleOffset, 0,
-                std::memory_order_acq_rel, std::memory_order_acquire)) {
-            g_physWorldCandidateOff = 0;
-            g_physWorldCandidateLive = {};
-            g_physWorldCandidateConfirmations = 0;
-        }
-    }
-
-    if (FindPhysWorldOffset(component)) {
-        offset = g_physWorldOff.load(std::memory_order_acquire);
-        Vec3 candidate{};
-        if (offset &&
-            driver->ReadProcessMemory(component + offset, &candidate, sizeof(candidate)) == 0 &&
-            ValidateWorldCoord(candidate)) {
-            const float dx = candidate.x - live.x;
-            const float dy = candidate.y - live.y;
-            const float dz = candidate.z - live.z;
-            if (dx * dx + dy * dy + dz * dz <= 9.0f) {
-                out = candidate;
-                return true;
-            }
-        }
-    }
-
-    out = live;
+    if (!IsValidAddr(component) ||
+        (component >= g_imageBase && component - g_imageBase < g_imageSize)) return false;
+    static thread_local std::vector<uint8_t> block(0x4000);
+    if (driver->ReadProcessMemory(component, block.data(),
+            static_cast<DWORD>(block.size())) != 0) return false;
+    framepos::Vec3 result{};
+    const auto candidates = framepos::FindPairs(block.data(), block.size());
+    std::lock_guard<std::mutex> lock(g_positionTrackerMtx);
+    if (!g_positionTracker.Choose(component, candidates, GetTickCount64(), result))
+        return false;
+    out = {result.x, result.y, result.z};
     return true;
 }
 
@@ -255,17 +163,18 @@ static Matrix4x4 g_frameProjection{};
 static Vec3 g_frameCamera{};
 static bool g_frameProjectionValid = false;
 static uint64_t g_frameSyncAddr = 0;
-static uint64_t g_imageBase = 0;
 static uint64_t g_ShellPage = 0;
 static uint64_t g_RingAddr = 0;
 static bool     g_frameSyncActive = false;
 static uint8_t  g_OrigBytes[32] = {};
+static uint8_t  g_FirstBytes[32] = {};
 static int      g_PatchLen = 0;
 static size_t   g_ShellSize = 0;
 static DWORD    g_frameSyncStart = 0;
-static bool     g_syncComplete = false;
+static DWORD    g_nextArmTick = 0;
 static HANDLE   g_registryScanThread = NULL;
-static constexpr DWORD COLLECT_MS = 499;
+static constexpr DWORD COLLECT_MS = 2000;
+static constexpr DWORD REARM_MS = 1000;
 
 static std::vector<OverlayVertex> g_vertexBuffer;
 static std::mutex g_Mtx;
@@ -274,7 +183,16 @@ static std::unordered_set<uint64_t> g_capturedFrames;
 static std::mutex g_frameMtx;
 static std::atomic<uint64_t> g_totalFrames{0};
 static uint64_t g_ReadIdx = 0;
-static constexpr size_t RING_SZ = 256;
+static constexpr size_t RING_SZ = 1024;
+static uint64_t g_fallbackArray = 0;
+static int g_fallbackAttempts = 0;
+static DWORD g_lastValidCapture = 0;
+struct CaptureStats {
+    uint64_t ringOk = 0, badAddr = 0, badVtable = 0, badId = 0;
+    uint64_t droppedStencil = 0, rejectedCoord = 0, rejectedDist = 0, passed = 0;
+    uint32_t lastRejectedClass = 0;
+};
+static CaptureStats g_captureStats;
 static uint64_t g_RoundPtr = 0;
 static bool g_RoundFound = false;
 
@@ -287,7 +205,7 @@ static constexpr DWORD ENTITY_UPDATE_INTERVAL = 33;
 
 static std::unordered_map<uint64_t, RenderSyncEntry> g_syncMap;
 static std::mutex g_syncMapMtx;
-static constexpr auto k_syncMaxAge = std::chrono::seconds(30);
+static constexpr auto k_syncMaxAge = std::chrono::seconds(4);
 static constexpr float k_viewportHeight = 1.72f;
 static constexpr float k_minRenderDist = 0.1f;
 
@@ -299,35 +217,50 @@ static bool DrvWriteRaw(const void* src, uint64_t dst, size_t sz) {
 }
 static bool DrvWriteExec(const void* src, uint64_t dst, size_t sz) {
     uint32_t old = 0;
-    DrvProtect(dst, sz, PAGE_EXECUTE_READWRITE, &old);
+    if (!DrvProtect(dst, sz, PAGE_EXECUTE_READWRITE, &old)) return false;
     bool ok = DrvWriteRaw(src, dst, sz);
     uint32_t tmp = 0;
-    DrvProtect(dst, sz, old ? old : PAGE_EXECUTE_READ, &tmp);
+    if (!DrvProtect(dst, sz, old, &tmp))
+        printf("[HOOK] Failed to restore code-page protection\n");
     return ok;
 }
 
 static int FindBoundary(const uint8_t* c, int minB) {
     int p = 0;
-    while (p < 32) {
-        uint8_t b = c[p];
-        bool rex = (b >= 0x40 && b <= 0x4F);
-        if (rex) { p++; b = c[p]; }
-        if (b >= 0x50 && b <= 0x5F) { p++; if (p >= minB) return p; continue; }
-        if (b == 0x90 || b == 0xCC || b == 0xC3) { p++; if (p >= minB) return p; continue; }
-        if (b==0x83||b==0x81||b==0x89||b==0x8B||b==0x8D||b==0x01||b==0x29||
-            b==0x31||b==0x33||b==0x39||b==0x3B||b==0x85||b==0x87) {
-            uint8_t m = c[p+1]; uint8_t mod = (m>>6)&3; uint8_t rm = m&7;
-            p += 2;
-            if (mod!=3) { if (rm==4) p++; if (mod==0&&rm==5) p+=4; else if (mod==1) p++; else if (mod==2) p+=4; }
-            if (b==0x83) p++; else if (b==0x81) p+=4;
-            if (p >= minB) return p; continue;
+    while (p < minB && p < 32) {
+        int start = p;
+        bool rexWide = false;
+        if (c[p] >= 0x40 && c[p] <= 0x4F) {
+            rexWide = (c[p] & 8) != 0;
+            if (++p >= 32) return 0;
         }
-        if (b == 0x0F) { p++; uint8_t m2 = c[p+1]; uint8_t mod=(m2>>6)&3; uint8_t rm=m2&7;
-            p += 2; if (mod!=3) { if(rm==4)p++; if(mod==0&&rm==5)p+=4; else if(mod==1)p++; else if(mod==2)p+=4; }
-            if (p >= minB) return p; continue; }
-        p++; if (p >= minB) return p;
+        const uint8_t opcode = c[p++];
+        if ((opcode >= 0x50 && opcode <= 0x5F) || opcode == 0x90) continue;
+        if (opcode >= 0xB8 && opcode <= 0xBF) {
+            p += rexWide ? 8 : 4;
+        } else if (opcode == 0x89 || opcode == 0x8B || opcode == 0x8D ||
+                   opcode == 0x83 || opcode == 0x81 || opcode == 0x85 ||
+                   opcode == 0x31 || opcode == 0x33 || opcode == 0x39) {
+            if (p >= 32) return 0;
+            const uint8_t modrm = c[p++];
+            const uint8_t mode = modrm >> 6, rm = modrm & 7;
+            if (mode != 3 && rm == 4) {
+                if (p >= 32) return 0;
+                const uint8_t sib = c[p++];
+                if (mode == 0 && (sib & 7) == 5) p += 4;
+            } else if (mode == 0 && rm == 5) {
+                return 0;
+            }
+            if (mode == 1) ++p;
+            if (mode == 2) p += 4;
+            if (opcode == 0x83) ++p;
+            if (opcode == 0x81) p += 4;
+        } else {
+            return 0;
+        }
+        if (p > 32 || p - start > 15) return 0;
     }
-    return p;
+    return p >= minB && p <= 30 ? p : 0;
 }
 
 static void RefreshConfiguredProjection() {
@@ -371,15 +304,16 @@ static bool W2S(const Vec3& w, Vec3& s, int W, int H) {
 
 #include "weather_fx.h"
 
-static bool ValidatePtr(uint64_t e){
-    if(!IsValidAddr(e))return false;if(!IsValidAddr(read<uint64_t>(e)))return false;
-    int id=read<int>(e+0x1C);return id>0&&id<1000;
-}
 static uint64_t ReadStencilBuffer(uint64_t e){if(!IsValidAddr(e))return 0;return read<uint64_t>(e+0xB8);}
 static uint8_t StencilByte4(uint64_t fb){return(uint8_t)((fb>>32)&0xFF);}
 static uint8_t StencilByte3(uint64_t fb){return(uint8_t)((fb>>24)&0xFF);}
-static bool IsActiveViewport(uint64_t e){return((ReadStencilBuffer(e)>>52)&0xFFF)==0x2C8;}
-static bool IsActiveStencil(uint64_t fb){return ((fb>>52)&0xFFF)==0x2C8;}
+static uint32_t StencilClass(uint64_t fb){return static_cast<uint32_t>((fb>>52)&0xFFF);}
+static constexpr uint32_t kPlayerStencils[] = { 0x448, 0x548, 0x2C8 };
+static bool IsActiveStencil(uint64_t fb){
+    for (uint32_t cls : kPlayerStencils) if (StencilClass(fb) == cls) return true;
+    return false;
+}
+static bool IsActiveViewport(uint64_t e){return IsActiveStencil(ReadStencilBuffer(e));}
 static bool IsClearedStencil(uint64_t fb){
     uint8_t b4=StencilByte4(fb);
     return b4==0x84||b4==0x82||b4==0x80;
@@ -410,82 +344,23 @@ static bool ValidateDepthStencil(uint64_t fb){
 static bool ValidateStencilMask(uint64_t e){
     return ValidateDepthStencil(ReadStencilBuffer(e));
 }
-
-static inline uint64_t mba_dec(uint64_t x) {
-    return (x & 0xFFFFFFFFFFFFULL) ^ (0x100010001ULL * ((x >> 48) & 0xFFFFULL));
-}
-
-static bool TryPlainPos(uint64_t actor, Vec3& out) {
-    uint32_t offsets[] = { 0x50, 0x60 };
-    for (int i = 0; i < 2; i++) {
-        Vec3 v = read<Vec3>(actor + offsets[i]);
-        if (!ValidateWorldCoord(v)) continue;
-        out = v;
-        return true;
-    }
-    return false;
-}
-
-static bool TryEncryptedPos(uint64_t actor, Vec3& out) {
-    uint32_t roots[] = { 0x20, 0x30 };
-    for (int ri = 0; ri < 2; ri++) {
-        uint64_t slot = read<uint64_t>(actor + roots[ri]);
-        if (!slot || !IsValidAddr(slot)) continue;
-
-        uint64_t val = read<uint64_t>(slot);
-        if (!val) continue;
-
-        uint64_t d = 0;
-        bool ok = true;
-        for (int step = 0; step < 4; ++step) {
-            d = mba_dec(val);
-            if (step == 3) break;
-            if (!d || !IsValidAddr(d)) { ok = false; break; }
-            val = read<uint64_t>(d);
-            if (!val) { ok = false; break; }
-        }
-        if (!ok || !d || !IsValidAddr(d)) continue;
-
-        uint32_t node_offsets[] = { 0x30, 0x00 };
-        for (int ni = 0; ni < 2; ni++) {
-            Vec3 v = read<Vec3>(d + node_offsets[ni]);
-            if (!ValidateWorldCoord(v)) continue;
-            out = v;
-            return true;
-        }
-    }
-    return false;
+static bool IsPlayerFilter(uint64_t entity, uint64_t stencil) {
+    const uint64_t bitfield = read<uint64_t>(entity + 0xB0);
+    return IsActiveStencil(bitfield) || IsActiveStencil(stencil) ||
+        ValidateDepthStencil(stencil);
 }
 
 static bool ReadActorOrigin(uint64_t actor, Vec3& out) {
-    if (!actor || !IsValidAddr(actor)) return false;
-
-    uint16_t flag_5e = read<uint16_t>(actor + 0x5E);
-    uint16_t flag_6e = read<uint16_t>(actor + 0x6E);
-
-    bool enc_5e = flag_5e == 0;
-    bool enc_6e = flag_6e == 0;
-    bool want_encrypted = enc_5e || enc_6e;
-    bool want_plain = (flag_5e != 0) && (flag_6e != 0);
-
-    if (want_encrypted) {
-        if (TryEncryptedPos(actor, out)) return true;
+    if (!IsValidAddr(actor)) return false;
+    const uint64_t list = read<uint64_t>(actor + 0xE0);
+    uint8_t index = 0;
+    if (!IsValidAddr(list) ||
+        driver->ReadProcessMemory(actor + 0x1EF, &index, sizeof(index)) != 0)
         return false;
-    }
-
-    if (want_plain) {
-        if (TryPlainPos(actor, out)) return true;
-    }
-
-    if (TryEncryptedPos(actor, out)) return true;
-    return TryPlainPos(actor, out);
-}
-
-static Vec3 ResolveViewportOrigin(uint64_t e) {
-    Vec3 pos{};
-    if (ReadActorOrigin(e, pos))
-        return pos;
-    return {};
+    const uint64_t component = read<uint64_t>(list + static_cast<uint64_t>(index) * 8);
+    if (!IsValidAddr(component) ||
+        (component >= g_imageBase && component - g_imageBase < g_imageSize)) return false;
+    return GetPhysWorldPos(component, out);
 }
 
 static void SyncFrameState(RenderSyncEntry& entry, const Vec3& new_pos, std::chrono::steady_clock::time_point now) {
@@ -543,39 +418,139 @@ static void FindRound() {
 
 static void PollFrameRing() {
     if (!g_RingAddr) return;
-    uint64_t wi=read<uint64_t>(g_RingAddr);
+    uint64_t wi = read<uint64_t>(g_RingAddr);
+    if (wi < g_ReadIdx) { ++g_captureStats.badAddr; return; }
+    if (wi - g_ReadIdx > RING_SZ) {
+        g_captureStats.badAddr += wi - g_ReadIdx - RING_SZ;
+        g_ReadIdx = wi - RING_SZ;
+    }
     while (g_ReadIdx < wi) {
-        uint64_t idx=g_ReadIdx&(RING_SZ-1);
-        uint64_t ep=read<uint64_t>(g_RingAddr+0x10+idx*8);
-        if (IsValidAddr(ep)&&ValidatePtr(ep)) { std::lock_guard<std::mutex> l(g_frameMtx); g_capturedFrames.insert(ep); g_totalFrames++; }
+        const uint64_t slot = g_RingAddr + 0x10 + (g_ReadIdx & (RING_SZ - 1)) * 16;
+        const uint64_t sequence = read<uint64_t>(slot);
+        if (sequence < g_ReadIdx + 1) break;
+        if (sequence != g_ReadIdx + 1) { ++g_ReadIdx; continue; }
+        const uint64_t entity = read<uint64_t>(slot + 8);
+        if (read<uint64_t>(slot) != sequence) continue;
+        if (!IsValidAddr(entity)) { ++g_captureStats.badAddr; ++g_ReadIdx; continue; }
+        uint64_t vtable = 0;
+        if (driver->ReadProcessMemory(entity, &vtable, sizeof(vtable)) != 0 ||
+            vtable < g_imageBase || vtable - g_imageBase >= g_imageSize) {
+            ++g_captureStats.badVtable; ++g_ReadIdx; continue;
+        }
+        uint32_t id = 0;
+        if (driver->ReadProcessMemory(entity + 0x1C, &id, sizeof(id)) != 0 || !id) {
+            ++g_captureStats.badId; ++g_ReadIdx; continue;
+        }
+        { std::lock_guard<std::mutex> lock(g_frameMtx); g_capturedFrames.insert(entity); }
+        ++g_captureStats.ringOk;
+        ++g_totalFrames;
+        g_lastValidCapture = GetTickCount();
         g_ReadIdx++;
+    }
+}
+
+static uint64_t FindFallbackArray(const std::unordered_set<uint64_t>& needles) {
+    if (needles.size() < 2 || g_fallbackAttempts >= 2) return 0;
+    ++g_fallbackAttempts;
+    HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, driver->ProcessId);
+    if (!process) return 0;
+    const uint64_t center = *needles.begin();
+    uint64_t address = center > 0x10000000 ? (center - 0x10000000) & ~0xFFFFULL : 0x10000;
+    const uint64_t limit = center + 0x10000000;
+    size_t scanned = 0;
+    int regions = 0;
+    std::vector<uint64_t> pointers(0x10000 / sizeof(uint64_t));
+    uint64_t found = 0;
+    MEMORY_BASIC_INFORMATION info{};
+    while (address < limit && scanned < 0x1000000 && regions++ < 128 &&
+           VirtualQueryEx(process, reinterpret_cast<LPCVOID>(address), &info, sizeof(info))) {
+        const uint64_t end = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+        if (end <= address) break;
+        if (info.State == MEM_COMMIT && !(info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+            (info.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY))) {
+            for (uint64_t pos = address; pos + 0x10000 <= end && scanned < 0x1000000;
+                 pos += 0x10000) {
+                scanned += 0x10000;
+                if (driver->ReadProcessMemory(pos, pointers.data(), 0x10000) != 0) continue;
+                for (size_t index = 0; index + 64 < pointers.size(); ++index) {
+                    if (!needles.count(pointers[index])) continue;
+                    for (size_t next = index + 1; next < index + 64; ++next) {
+                        if (pointers[next] != pointers[index] && needles.count(pointers[next])) {
+                            found = pos + index * sizeof(uint64_t);
+                            break;
+                        }
+                    }
+                    if (found) break;
+                }
+                if (found) break;
+            }
+        }
+        if (found) break;
+        address = end;
+    }
+    CloseHandle(process);
+    printf("[ENTITY-FALLBACK] attempt %d scanned %zu bytes, array=0x%llX\n",
+        g_fallbackAttempts, scanned, (unsigned long long)found);
+    return found;
+}
+
+static void PollFallbackArray(std::vector<uint64_t>& captured) {
+    if (!g_fallbackArray) return;
+    for (int index = 0; index < 64; ++index) {
+        const uint64_t entity = read<uint64_t>(g_fallbackArray + index * 8);
+        if (!IsValidAddr(entity)) continue;
+        uint64_t vtable = 0;
+        uint32_t id = 0;
+        if (driver->ReadProcessMemory(entity, &vtable, sizeof(vtable)) == 0 &&
+            vtable >= g_imageBase && vtable - g_imageBase < g_imageSize &&
+            driver->ReadProcessMemory(entity + 0x1C, &id, sizeof(id)) == 0 && id)
+            captured.push_back(entity);
     }
 }
 
 static bool AttachFrameSync() {
     if (g_frameSyncActive||!g_frameSyncAddr||!g_ShellPage) return false;
-    for (int i=0;i<32;i++) g_OrigBytes[i]=read<uint8_t>(g_frameSyncAddr+i);
+    if (driver->ReadProcessMemory(g_frameSyncAddr, g_OrigBytes, sizeof(g_OrigBytes)) != 0)
+        return false;
     g_PatchLen = FindBoundary(g_OrigBytes, 14);
-    if (g_PatchLen<14||g_PatchLen>30) return false;
-    uint8_t sc[80]={}; int p=0;
-    sc[p++]=0x50; sc[p++]=0x52;
+    if (!g_PatchLen) {
+        printf("[HOOK] Unsupported or relative prologue, refusing to patch\n");
+        return false;
+    }
+    if (g_ShellSize && memcmp(g_OrigBytes, g_FirstBytes, sizeof(g_OrigBytes)) != 0)
+        return false;
+    uint8_t sc[160]={}; int p=0;
+    const uint8_t save[] = { 0x9C, 0x50, 0x52, 0x41, 0x50, 0x41, 0x51,
+                             0x41, 0x52, 0x41, 0x53 };
+    memcpy(sc + p, save, sizeof(save)); p += sizeof(save);
     sc[p++]=0x48; sc[p++]=0xB8;
-    *(uint64_t*)&sc[p]=g_RingAddr; p+=8;
-    sc[p++]=0x48; sc[p++]=0x8B; sc[p++]=0x10;
-    sc[p++]=0x0F; sc[p++]=0xB6; sc[p++]=0xD2;
-    sc[p++]=0x48; sc[p++]=0x89; sc[p++]=0x4C; sc[p++]=0xD0; sc[p++]=0x10;
-    sc[p++]=0x48; sc[p++]=0xFF; sc[p++]=0x00;
-    sc[p++]=0x5A; sc[p++]=0x58;
+    memcpy(sc + p, &g_RingAddr, 8); p+=8;
+    const uint8_t reserve[] = { 0xBA, 0x01, 0, 0, 0, 0xF0, 0x48, 0x0F, 0xC1, 0x10,
+                                0x49, 0x89, 0xD1, 0x49, 0xFF, 0xC1,
+                                0x81, 0xE2, 0xFF, 0x03, 0, 0,
+                                0x48, 0xC1, 0xE2, 0x04, 0x48, 0x8D, 0x44, 0x10, 0x10,
+                                0x48, 0x89, 0x48, 0x08, 0x4C, 0x87, 0x08 };
+    memcpy(sc + p, reserve, sizeof(reserve)); p += sizeof(reserve);
+    const uint8_t restore[] = { 0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59,
+                                0x41, 0x58, 0x5A, 0x58, 0x9D };
+    memcpy(sc + p, restore, sizeof(restore)); p += sizeof(restore);
     memcpy(&sc[p],g_OrigBytes,g_PatchLen); p+=g_PatchLen;
     sc[p++]=0xFF; sc[p++]=0x25; sc[p++]=0; sc[p++]=0; sc[p++]=0; sc[p++]=0;
-    *(uint64_t*)&sc[p]=g_frameSyncAddr+g_PatchLen; p+=8;
-    g_ShellSize=p;
-    if (!DrvWriteRaw(sc, g_ShellPage, p)) return false;
-    uint32_t old=0; DrvProtect(g_ShellPage, 4096, PAGE_EXECUTE_READWRITE, &old);
-    uint64_t zero=0; DrvWriteRaw(&zero, g_RingAddr, 8); g_ReadIdx=0;
+    const uint64_t returnAddr = g_frameSyncAddr + g_PatchLen;
+    memcpy(sc + p, &returnAddr, 8); p += 8;
+    if (!g_ShellSize) {
+        if (!DrvWriteRaw(sc, g_ShellPage, p)) return false;
+        uint32_t old=0;
+        if (!DrvProtect(g_ShellPage, 4096, PAGE_EXECUTE_READ, &old)) return false;
+        memcpy(g_FirstBytes, g_OrigBytes, sizeof(g_OrigBytes));
+        g_ShellSize = p;
+    }
+    std::vector<uint8_t> zero(0x10 + RING_SZ * 16);
+    if (!DrvWriteRaw(zero.data(), g_RingAddr, zero.size())) return false;
+    g_ReadIdx = 0;
     uint8_t hook[32]={};
     hook[0]=0xFF; hook[1]=0x25; hook[2]=0; hook[3]=0; hook[4]=0; hook[5]=0;
-    *(uint64_t*)&hook[6]=g_ShellPage;
+    memcpy(hook + 6, &g_ShellPage, 8);
     for(int i=14;i<g_PatchLen;i++) hook[i]=0x90;
     if (!DrvWriteExec(hook, g_frameSyncAddr, g_PatchLen)) return false;
     g_frameSyncActive=true; g_frameSyncStart=GetTickCount();
@@ -587,6 +562,7 @@ static bool DetachFrameSync() {
     if (!g_frameSyncActive) return false;
     if (!DrvWriteExec(g_OrigBytes, g_frameSyncAddr, g_PatchLen)) return false;
     g_frameSyncActive=false;
+    g_nextArmTick=GetTickCount()+REARM_MS;
     printf("[HOOK] REMOVED - .text restored after %dms\n", GetTickCount()-g_frameSyncStart);
 return true;
 }
@@ -637,37 +613,22 @@ static void AppendTrailSample(TrailBuffer* t, Vec3 pos) {
 
 static bool InitRenderPipeline(uint64_t base, uint64_t size) {
     g_imageBase=base;
+    g_imageSize=size;
     auto secs=GetPESections(base);
     if(secs.empty()) return false;
     if(!CacheTextSection(base,secs)) return false;
     ScanConfiguredPointers(base);
     auto calls=FindEntityFunctionCalls(base);
 
-    // Prefer the supplied actor capture site when its preceding MOV bytes
-    // match this build. Retain signature-based discovery as a safe fallback.
-    if (OFFSETS::ActorMovRva + sizeof(OFFSETS::ActorMovBytes) <= size &&
-        OFFSETS::ActorPatchRva + 32 <= size) {
-        uint8_t actorMov[sizeof(OFFSETS::ActorMovBytes)]{};
-        if (driver->ReadProcessMemory(base + OFFSETS::ActorMovRva,
-                actorMov, sizeof(actorMov)) == 0 &&
-            memcmp(actorMov, OFFSETS::ActorMovBytes, sizeof(actorMov)) == 0) {
-            g_frameSyncAddr = base + OFFSETS::ActorPatchRva;
-            printf("[ENTITY-SCAN] Using configured actor patch RVA 0x%llX\n",
-                (unsigned long long)OFFSETS::ActorPatchRva);
-        } else {
-            printf("[ENTITY-SCAN] Configured actor MOV validation failed; using signature fallback\n");
-        }
-    }
-    for(auto& c:calls) if(!g_frameSyncAddr&&c.hasTestAlAl){g_frameSyncAddr=c.targetVA;break;}
-    if(!g_frameSyncAddr&&!calls.empty()) g_frameSyncAddr=calls[0].targetVA;
+    std::unordered_set<uint64_t> candidates;
+    for (const auto& call : calls) if (call.hasTestAlAl) candidates.insert(call.targetVA);
+    if (candidates.empty()) for (const auto& call : calls) candidates.insert(call.targetVA);
+    if (candidates.size() == 1) g_frameSyncAddr = *candidates.begin();
+    else printf("[ENTITY-SCAN] %zu entity targets; refusing ambiguous hook\n", candidates.size());
     if(!g_frameSyncAddr) return false;
-    KAllocRequest ar={}; ar.ProcessId=driver->ProcessId; ar.Size=8192;
-    ar.AllocationType=MEM_COMMIT|MEM_RESERVE; ar.Protect=PAGE_READWRITE;
-    ULONG ret=0;
-    GetNtApi().Ioctl(driver->Handle(),IOCTL_ALLOC_MEMORY,&ar,sizeof(ar),&ar,sizeof(ar),&ret);
-    g_ShellPage=ar.Address;
+    g_ShellPage=driver->AllocMemory(0x6000, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
     if(!g_ShellPage) return false;
-    g_RingAddr=g_ShellPage+0x100;
+    g_RingAddr=g_ShellPage+0x1000;
     FindRound();
     if (!g_pViewDataPtr && OFFSETS::ViewMatrixRva + sizeof(uint64_t) <= size) {
         const uint64_t configuredViewPtr = base + OFFSETS::ViewMatrixRva;
@@ -698,18 +659,19 @@ static bool InitRenderPipeline(uint64_t base, uint64_t size) {
 
     CreateThread(NULL, 0, [](LPVOID) -> DWORD { ScanSidewards(); return 0; }, NULL, 0, NULL);
 
-    printf("[R6] Position system: ReadActorOrigin (encrypted+plain, driver read)\n");
+    printf("[R6] Position system: indexed skeleton component, paired positions\n");
     return true;
 }
 
 static void ShutdownRenderPipeline() {
+    if(g_frameSyncActive && !DetachFrameSync())
+        printf("[HOOK] Restore failed; keeping capture allocation live\n");
     if (g_registryScanThread) {
         if (WaitForSingleObject(g_registryScanThread, 2000) == WAIT_OBJECT_0)
             CloseHandle(g_registryScanThread);
         g_registryScanThread = NULL;
     }
     RestoreSidewards();
-    if(g_frameSyncActive) DetachFrameSync();
     FlushSyncBuffer();
     skel::CloseLog();
     if(g_log){fclose(g_log);g_log=nullptr;}
@@ -743,13 +705,16 @@ static void PollSyncBuffer(int W, int H, int maxD) {
         if (sidewardsEnabled && g_Sidewards.found) {
             SetSidewardsValue(sidewardsValue);
         }
-        g_syncComplete = false;
+        g_nextArmTick = now_tick + 4000;
+        g_captureStats = {};
+        g_fallbackArray = 0;
+        { std::lock_guard<std::mutex> lock(g_positionTrackerMtx); g_positionTracker.Clear(); }
         FlushSyncBuffer();
         { std::lock_guard<std::mutex> l(g_frameMtx); g_capturedFrames.clear(); }
     }
 
     if (!isGameplay && wasGameplay) {
-        g_syncComplete = false;
+        if (g_frameSyncActive) DetachFrameSync();
         FlushSyncBuffer();
         { std::lock_guard<std::mutex> l(g_frameMtx); g_capturedFrames.clear(); }
     }
@@ -766,18 +731,31 @@ static void PollSyncBuffer(int W, int H, int maxD) {
     }
 
     bool delayPassed = (s_hookDelayStart > 0 && (now_tick - s_hookDelayStart) >= s_hookDelayMs);
-    if (!g_frameSyncActive && !g_syncComplete && isGameplay && delayPassed) {
-        AttachFrameSync();
-        s_hookDelayStart = 0;
+    if (!g_frameSyncActive && isGameplay && delayPassed &&
+        static_cast<int32_t>(now_tick - g_nextArmTick) >= 0) {
+        if (!AttachFrameSync()) g_nextArmTick = now_tick + 5000;
     }
-    if (g_frameSyncActive) { PollFrameRing(); if (GetTickCount() - g_frameSyncStart > COLLECT_MS) { DetachFrameSync(); g_syncComplete = true; } }
+    if (g_frameSyncActive) {
+        PollFrameRing();
+        if (now_tick - g_frameSyncStart >= COLLECT_MS && DetachFrameSync())
+            PollFrameRing();
+    }
 
     std::vector<uint64_t> cap;
     {
         std::lock_guard<std::mutex> l(g_frameMtx);
-        for (auto it = g_capturedFrames.begin(); it != g_capturedFrames.end(); ++it) {
-            if (IsValidAddr(*it)) cap.push_back(*it);
+        cap.assign(g_capturedFrames.begin(), g_capturedFrames.end());
+        g_capturedFrames.clear();
+    }
+    if (cap.empty() && g_lastValidCapture &&
+        now_tick - g_lastValidCapture > 2500) {
+        std::unordered_set<uint64_t> needles;
+        {
+            std::lock_guard<std::mutex> lock(g_syncMapMtx);
+            for (const auto& pair : g_syncMap) needles.insert(pair.first);
         }
+        if (!g_fallbackArray) g_fallbackArray = FindFallbackArray(needles);
+        PollFallbackArray(cap);
     }
 
     Vec3 cam = QueryCameraOrigin();
@@ -800,7 +778,9 @@ static void PollSyncBuffer(int W, int H, int maxD) {
 
         for (uint64_t ea : cap) {
             uint64_t fb = ReadStencilBuffer(ea);
-            if (!IsActiveStencil(fb) && !ValidateDepthStencil(fb)) {
+            if (!IsPlayerFilter(ea, fb)) {
+                ++g_captureStats.droppedStencil;
+                g_captureStats.lastRejectedClass = StencilClass(fb);
                 g_syncMap.erase(ea);
                 continue;
             }
@@ -812,6 +792,10 @@ static void PollSyncBuffer(int W, int H, int maxD) {
             Vec3 position{};
             if (ReadActorOrigin(ea, position))
                 SyncFrameState(entry, position, now);
+            else {
+                ++g_captureStats.rejectedCoord;
+                g_syncMap.erase(ea);
+            }
         }
 
 
@@ -829,7 +813,7 @@ static void PollSyncBuffer(int W, int H, int maxD) {
             uint64_t ea = it->first;
             auto& entry = it->second;
 
-            if (!ValidateDepthStencil(entry.filter_byte))
+            if (!IsPlayerFilter(ea, entry.filter_byte))
                 continue;
 
 
@@ -842,8 +826,10 @@ static void PollSyncBuffer(int W, int H, int maxD) {
                 (draw_pos.y - cam.y) * (draw_pos.y - cam.y) +
                 (draw_pos.z - cam.z) * (draw_pos.z - cam.z));
 
-            if (d < k_minRenderDist || d >(float)maxD)
+            if (d < k_minRenderDist || d >(float)maxD) {
+                ++g_captureStats.rejectedDist;
                 continue;
+            }
 
             Vec3 sp = {};
             bool on = W2S(draw_pos, sp, W, H);
@@ -852,7 +838,7 @@ static void PollSyncBuffer(int W, int H, int maxD) {
             e.instance = ea;
             e.position = draw_pos;
             e.status = IsClearedStencil(entry.filter_byte) ? ActorStatus::DEAD_1 : ActorStatus::VALID;
-            e.isPlayer = IsActiveStencil(entry.filter_byte);
+            e.isPlayer = true;
             e.distance = d;
             e.screenPos = sp;
             e.onScreen = on;
@@ -886,6 +872,7 @@ static void PollSyncBuffer(int W, int H, int maxD) {
             }
 
             g_vertexBuffer.push_back(e);
+            ++g_captureStats.passed;
             g_vtxCount++;
             if (e.isPlayer) g_activeVtx++;
         }
@@ -1215,8 +1202,29 @@ static void FlushOverlayPipeline(bool box, bool corner, bool line, bool dist, in
 
     char info[256];
     snprintf(info, 256, "P:%d E:%d Hook:%s Rnd:%d Cache:%d",
-        g_activeVtx, g_vtxCount, g_frameSyncActive ? "ON" : (g_syncComplete ? "done" : "wait"),
+        g_activeVtx, g_vtxCount, g_frameSyncActive ? "ON" : "gap",
         g_RoundFound ? ReadRound() : -1,
         (int)g_syncMap.size());
     dl->AddText({10, 10}, IM_COL32(0, 255, 0, 200), info);
+    char diagnostics[256];
+    snprintf(diagnostics, sizeof(diagnostics),
+        "ring: ok %llu | bad addr %llu | bad vtable %llu | bad id %llu",
+        (unsigned long long)g_captureStats.ringOk,
+        (unsigned long long)g_captureStats.badAddr,
+        (unsigned long long)g_captureStats.badVtable,
+        (unsigned long long)g_captureStats.badId);
+    dl->AddText({10, 28}, IM_COL32(0, 255, 0, 200), diagnostics);
+    snprintf(diagnostics, sizeof(diagnostics),
+        "dropped at capture %llu (last cls 0x%03X) | Captured %llu | SyncMap %zu | Vtx %d",
+        (unsigned long long)g_captureStats.droppedStencil,
+        g_captureStats.lastRejectedClass,
+        (unsigned long long)g_totalFrames.load(), g_syncMap.size(), g_vtxCount);
+    dl->AddText({10, 46}, IM_COL32(0, 255, 0, 200), diagnostics);
+    snprintf(diagnostics, sizeof(diagnostics),
+        "rejected: stencil %llu | coord %llu | dist %llu | passed %llu",
+        (unsigned long long)g_captureStats.droppedStencil,
+        (unsigned long long)g_captureStats.rejectedCoord,
+        (unsigned long long)g_captureStats.rejectedDist,
+        (unsigned long long)g_captureStats.passed);
+    dl->AddText({10, 64}, IM_COL32(0, 255, 0, 200), diagnostics);
 }

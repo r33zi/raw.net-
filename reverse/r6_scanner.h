@@ -74,15 +74,12 @@ static uint64_t ScanSigRipRelative(const char* pattern, int instructionOffset,
     return pointerAddress;
 }
 
-static uint64_t g_pGameManagerPtr = 0;
 static uint64_t g_pViewDataPtr = 0;
 static uint64_t g_pCameraManagerPtr = 0;
 static uint64_t g_pInGameFlag = 0;
 static uint64_t g_actorCaller = 0;
 
 static void ScanConfiguredPointers(uint64_t moduleBase) {
-    g_pGameManagerPtr = ScanSigRipRelative(
-        OFFSETS::GameManagerSignature, 0, moduleBase);
     g_pViewDataPtr = ScanSigRipRelative(
         OFFSETS::ViewMatrixSignature, 0, moduleBase);
     g_pCameraManagerPtr = ScanSigRipRelative(
@@ -100,9 +97,8 @@ static void ScanConfiguredPointers(uint64_t moduleBase) {
     if (actorCallerMatch != SIZE_MAX)
         g_actorCaller = g_textCache.textBase + actorCallerMatch;
 
-    printf("[SIG] GameManager=0x%llX ViewData=0x%llX CameraManager=0x%llX "
+    printf("[SIG] ViewData=0x%llX CameraManager=0x%llX "
            "InGameFlag=0x%llX ActorCaller=0x%llX\n",
-        (unsigned long long)g_pGameManagerPtr,
         (unsigned long long)g_pViewDataPtr,
         (unsigned long long)g_pCameraManagerPtr,
         (unsigned long long)g_pInGameFlag,
@@ -181,6 +177,10 @@ static std::vector<CallTarget> FindEntityFunctionCalls(uint64_t moduleBase) {
         }
     }
     printf("[ENTITY-SCAN] %d anchors, %zu calls\n", anchors, res.size());
+    if (anchors < 1 || anchors > 2) {
+        printf("[ENTITY-SCAN] Anchor missing or ambiguous; refusing to hook\n");
+        res.clear();
+    }
     std::sort(res.begin(),res.end(),[](auto&a,auto&b){return a.hasTestAlAl>b.hasTestAlAl;});
     return res;
 }

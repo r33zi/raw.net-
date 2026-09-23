@@ -138,8 +138,8 @@ namespace skel
     }
 
 
-    inline uint64_t g_componentArrayOffset = 0;
-    inline uint32_t g_compIdxOff = 0;
+    inline uint64_t g_componentArrayOffset = 0xE0;
+    inline uint32_t g_compIdxOff = 0x1EF;
 
     // TAG-DISCOVERY DIAGNOSTIC — dumps 16 bytes before each of the first N pointers
     // in a candidate component list, so the real character-component tag stands out
@@ -225,32 +225,15 @@ namespace skel
     inline uint64_t FindCharacterComponent(uint64_t entity, float dx = 0.f, float dy = 0.f, float dz = 0.f)
     {
         if (!ValidPtr(entity)) return 0;
-
-        if (g_componentArrayOffset)
-            if (uint64_t c = ScanListForCharacter(
-                    Read<uint64_t>(entity + g_componentArrayOffset), dx, dy, dz))
-                return c;
-
-        // Brute-force sweep to find the component array.
-        for (uint64_t off = 0xA0; off <= 0x3F8; off += 8) {
-            if (off == g_componentArrayOffset) continue;
-            uint64_t list = Read<uint64_t>(entity + off);
-            if (!ValidPtr(list)) continue;
-            // Quick check: does this list have at least 3 valid pointers?
-            int valid = 0;
-            for (int j = 0; j < 8; j++) {
-                uint64_t p = Read<uint64_t>(list + j * 8);
-                if (ValidPtr(p)) valid++;
-            }
-            if (valid < 3) continue;
-            if (uint64_t c = ScanListForCharacter(list, dx, dy, dz)) {
-                g_componentArrayOffset = off;
-                printf("[SKEL] compArrayOffset corrected: +0x%llX (comp=0x%llX)\n",
-                    (unsigned long long)off, (unsigned long long)c);
-                return c;
-            }
-        }
-        return 0;
+        g_componentArrayOffset = 0xE0;
+        g_compIdxOff = 0x1EF;
+        const uint64_t list = Read<uint64_t>(entity + g_componentArrayOffset);
+        const uint8_t index = Read<uint8_t>(entity + g_compIdxOff);
+        if (!ValidPtr(list)) return 0;
+        const uint64_t component = Read<uint64_t>(list + (uint64_t)index * 8);
+        if (!ValidPtr(component) ||
+            (component >= g_imageBase && component - g_imageBase < g_imageSize)) return 0;
+        return component;
     }
 
 
@@ -1132,19 +1115,45 @@ namespace skel
         const uint32_t stride = (uint32_t)kBoneStride;
         const uint32_t trans  = (uint32_t)kBoneTranslate;
         size_t bytes = (size_t)count * stride;
-        if (bytes > 0x20000) return false;
+        if (count < 17 || bytes > 0x20000 || max_out < 17) return false;
         static thread_local std::vector<uint8_t> pbuf;
         pbuf.resize(bytes);
-        if (!ReadRaw(palette, pbuf.data(), bytes)) return false;
-        int n = 0;
-        for (uint32_t i = 0; i < count && n < max_out; ++i) {
-            Vec3f v;
-            memcpy(&v, pbuf.data() + (size_t)i * stride + trans, 12);
-            if (std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z))
-                out[n++] = v;
+        for (int attempt = 0; attempt < 10; ++attempt) {
+            if (!ReadRaw(palette, pbuf.data(), bytes)) continue;
+            int n = 0;
+            float minX = FLT_MAX, maxX = -FLT_MAX;
+            float minY = FLT_MAX, maxY = -FLT_MAX;
+            float minZ = FLT_MAX, maxZ = -FLT_MAX;
+            for (uint32_t index = 0; index < count && n < max_out; ++index) {
+                const uint8_t* entry = pbuf.data() + (size_t)index * stride;
+                float homogeneous = 0.f, padding[3]{};
+                memcpy(&homogeneous, entry + 0x3C, sizeof(float));
+                for (int row = 0; row < 3; ++row)
+                    memcpy(&padding[row], entry + row * 0x10 + 0xC, sizeof(float));
+                if (!std::isfinite(homogeneous) || !std::isfinite(padding[0]) ||
+                    !std::isfinite(padding[1]) || !std::isfinite(padding[2]) ||
+                    fabsf(homogeneous - 1.f) > 0.001f ||
+                    fabsf(padding[0]) > 0.001f || fabsf(padding[1]) > 0.001f ||
+                    fabsf(padding[2]) > 0.001f) break;
+                Vec3f value;
+                memcpy(&value, entry + trans, sizeof(value));
+                if (!std::isfinite(value.x) || !std::isfinite(value.y) ||
+                    !std::isfinite(value.z)) break;
+                out[n++] = value;
+                minX = std::min(minX, value.x); maxX = std::max(maxX, value.x);
+                minY = std::min(minY, value.y); maxY = std::max(maxY, value.y);
+                minZ = std::min(minZ, value.z); maxZ = std::max(maxZ, value.z);
+            }
+            const float width = std::max(maxX - minX, maxY - minY);
+            const float height = maxZ - minZ;
+            if (n >= 17 && height >= 1.4f && height <= 2.1f &&
+                width < 1.f && height >= 1.6f * width) {
+                out_count = n;
+                return true;
+            }
         }
-        out_count = n;
-        return n > 0;
+        out_count = 0;
+        return false;
     }
 
 
