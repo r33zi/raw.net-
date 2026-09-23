@@ -126,14 +126,12 @@ static bool xInitD3d();
 static void xMainLoop();
 static void xShutdown();
 void SubmitDrawCalls();
+static LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
+extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
 
 static HWND Window = NULL;
-static LONG_PTR g_medalStyle = 0;
-static LONG_PTR g_medalExStyle = 0;
-static WINDOWPLACEMENT g_medalPlacement = { sizeof(WINDOWPLACEMENT) };
-static bool g_medalWasVisible = false;
-static bool g_medalStateCaptured = false;
-static bool g_medalPlacementCaptured = false;
+static HWND g_medalWindow = NULL;
+static const char* g_overlayClassName = "PasterSixMedalOverlay";
 IDirect3D9Ex* p_Object = NULL;
 static LPDIRECT3DDEVICE9 D3dDevice = NULL;
 static LPDIRECT3DVERTEXBUFFER9 TriBuf = NULL;
@@ -427,32 +425,40 @@ int main(int argc, const char* argv[]) {
 }
 
 bool xCreateWindow() {
-    for (int attempt = 0; attempt < 40 && !Window; ++attempt) {
-        Window = FindMedalOverlay();
-        if (!Window) Sleep(250);
+    for (int attempt = 0; attempt < 40 && !g_medalWindow; ++attempt) {
+        g_medalWindow = FindMedalOverlay();
+        if (!g_medalWindow) Sleep(250);
     }
-    if (!Window) return false;
-
-    g_medalStyle = GetWindowLongPtr(Window, GWL_STYLE);
-    g_medalExStyle = GetWindowLongPtr(Window, GWL_EXSTYLE);
-    g_medalPlacement.length = sizeof(WINDOWPLACEMENT);
-    g_medalPlacementCaptured = GetWindowPlacement(Window, &g_medalPlacement) != FALSE;
-    g_medalWasVisible = IsWindowVisible(Window) != FALSE;
-    g_medalStateCaptured = true;
-
-    const LONG_PTR overlayExStyle = g_medalExStyle | WS_EX_TOPMOST | WS_EX_NOACTIVATE |
-        WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_LAYERED;
-    SetLastError(ERROR_SUCCESS);
-    if (SetWindowLongPtr(Window, GWL_EXSTYLE, overlayExStyle) == 0 &&
-        GetLastError() != ERROR_SUCCESS)
-        return false;
+    if (!g_medalWindow) return false;
 
     RECT bounds = {};
     if (!GetGameClientBounds(&bounds)) return false;
     Width = bounds.right - bounds.left;
     Height = bounds.bottom - bounds.top;
-    SetWindowPos(Window, HWND_TOPMOST, bounds.left, bounds.top, Width, Height,
-        SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+
+    WNDCLASSEXA windowClass = {};
+    windowClass.cbSize = sizeof(windowClass);
+    windowClass.style = CS_HREDRAW | CS_VREDRAW;
+    windowClass.lpfnWndProc = OverlayWndProc;
+    windowClass.hInstance = GetModuleHandleA(NULL);
+    windowClass.hCursor = LoadCursor(NULL, IDC_ARROW);
+    windowClass.lpszClassName = g_overlayClassName;
+    if (!RegisterClassExA(&windowClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        return false;
+
+    Window = CreateWindowExA(WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT |
+        WS_EX_TOOLWINDOW | WS_EX_LAYERED, g_overlayClassName, _g_overlayWindowTitle,
+        WS_POPUP, bounds.left, bounds.top, Width, Height, NULL, NULL,
+        windowClass.hInstance, NULL);
+    if (!Window) {
+        UnregisterClassA(g_overlayClassName, windowClass.hInstance);
+        return false;
+    }
+
+    const MARGINS margins = { -1 };
+    DwmExtendFrameIntoClientArea(Window, &margins);
+    SetLayeredWindowAttributes(Window, 0, 255, LWA_ALPHA);
+    ShowWindow(Window, SW_SHOWNOACTIVATE);
     UpdateWindow(Window);
     return true;
 }
@@ -1041,6 +1047,15 @@ void xMainLoop() {
     ImGui::DestroyContext();
 }
 
+LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    if (ImGui_ImplWin32_WndProcHandler(hWnd, message, wParam, lParam)) return 1;
+    if (message == WM_DESTROY) {
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcA(hWnd, message, wParam, lParam);
+}
+
 void xShutdown() {
     ShutdownRenderPipeline();
     ReleaseShaderResources();
@@ -1048,16 +1063,8 @@ void xShutdown() {
     if (D3dDevice) { D3dDevice->Release(); D3dDevice = nullptr; }
     if (p_Object) { p_Object->Release(); p_Object = nullptr; }
 
-    if (Window && IsWindow(Window) && g_medalStateCaptured) {
-        SetWindowLongPtr(Window, GWL_STYLE, g_medalStyle);
-        SetWindowLongPtr(Window, GWL_EXSTYLE, g_medalExStyle);
-        if (g_medalPlacementCaptured)
-            SetWindowPlacement(Window, &g_medalPlacement);
-        SetWindowPos(Window, (g_medalExStyle & WS_EX_TOPMOST) ? HWND_TOPMOST : HWND_NOTOPMOST,
-            0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-        ShowWindow(Window, g_medalWasVisible ? SW_SHOWNOACTIVATE : SW_HIDE);
-    }
+    if (Window && IsWindow(Window)) DestroyWindow(Window);
+    UnregisterClassA(g_overlayClassName, GetModuleHandleA(NULL));
     Window = NULL;
-    g_medalStateCaptured = false;
-    g_medalPlacementCaptured = false;
+    g_medalWindow = NULL;
 }
