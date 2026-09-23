@@ -1140,11 +1140,11 @@ namespace skel
                 if (!std::isfinite(value.x) || !std::isfinite(value.y) ||
                     !std::isfinite(value.z)) break;
                 out[n++] = value;
-                minX = std::min(minX, value.x); maxX = std::max(maxX, value.x);
-                minY = std::min(minY, value.y); maxY = std::max(maxY, value.y);
-                minZ = std::min(minZ, value.z); maxZ = std::max(maxZ, value.z);
+                minX = (std::min)(minX, value.x); maxX = (std::max)(maxX, value.x);
+                minY = (std::min)(minY, value.y); maxY = (std::max)(maxY, value.y);
+                minZ = (std::min)(minZ, value.z); maxZ = (std::max)(maxZ, value.z);
             }
-            const float width = std::max(maxX - minX, maxY - minY);
+            const float width = (std::max)(maxX - minX, maxY - minY);
             const float height = maxZ - minZ;
             if (n >= 17 && height >= 1.4f && height <= 2.1f &&
                 width < 1.f && height >= 1.6f * width) {
