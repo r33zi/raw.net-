@@ -594,12 +594,18 @@ static void UpdateOverlayInteractivity() {
 
     LONG_PTR style = GetWindowLongPtr(Window, GWL_EXSTYLE);
     if (ShowMenu)
-        style &= ~WS_EX_TRANSPARENT;
+        style &= ~(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
     else
-        style |= WS_EX_TRANSPARENT;
+        style |= WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
     SetWindowLongPtr(Window, GWL_EXSTYLE, style);
     SetWindowPos(Window, NULL, 0, 0, 0, 0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    if (ShowMenu && IsGameOrOverlayForeground()) {
+        SetForegroundWindow(Window);
+    } else if (!ShowMenu) {
+        if (GetCapture() == Window) ReleaseCapture();
+        if (GetForegroundWindow() == Window) SetForegroundWindow(hwnd);
+    }
     previousMenuState = ShowMenu;
 }
 
@@ -1050,6 +1056,7 @@ void xMainLoop() {
 
 LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     if (ImGui_ImplWin32_WndProcHandler(hWnd, message, wParam, lParam)) return 1;
+    if (message == WM_MOUSEACTIVATE && ShowMenu) return MA_ACTIVATE;
     if (message == WM_DESTROY) {
         PostQuitMessage(0);
         return 0;
