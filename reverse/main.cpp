@@ -131,6 +131,9 @@ extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT message, WPARAM wP
 
 static HWND Window = NULL;
 static HWND g_medalWindow = NULL;
+static RECT g_menuBounds = {};
+static bool g_menuMouseHeld = false;
+static bool g_overlayMouseInteractive = false;
 static const char* g_overlayClassName = "PasterSixMedalOverlay";
 IDirect3D9Ex* p_Object = NULL;
 static LPDIRECT3DDEVICE9 D3dDevice = NULL;
@@ -583,30 +586,38 @@ static void UpdateOverlayInput() {
     else
         io.MousePos = ImVec2(-FLT_MAX, -FLT_MAX);
 
-    io.MouseDown[0] = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-    io.MouseDown[1] = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
-    io.MouseDown[2] = (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
+    static bool previousDown[3] = {};
+    static bool menuOwned[3] = {};
+    const int buttons[3] = { VK_LBUTTON, VK_RBUTTON, VK_MBUTTON };
+    g_menuMouseHeld = false;
+    for (int button = 0; button < 3; ++button) {
+        const bool down = (GetAsyncKeyState(buttons[button]) & 0x8000) != 0;
+        if (!down || !ShowMenu) menuOwned[button] = false;
+        else if (!previousDown[button]) menuOwned[button] = g_overlayMouseInteractive;
+        io.MouseDown[button] = down && menuOwned[button];
+        g_menuMouseHeld |= io.MouseDown[button];
+        previousDown[button] = down;
+    }
 }
 
 static void UpdateOverlayInteractivity() {
-    static bool previousMenuState = !ShowMenu;
-    if (previousMenuState == ShowMenu) return;
+    POINT cursor = {};
+    const bool overMenu = GetCursorPos(&cursor) && ScreenToClient(Window, &cursor) &&
+        PtInRect(&g_menuBounds, cursor);
+    const bool interactive = ShowMenu && (overMenu || g_menuMouseHeld ||
+        GetCapture() == Window || ImGui::GetIO().WantCaptureMouse);
+    if (!ShowMenu && GetCapture() == Window) ReleaseCapture();
+    if (interactive == g_overlayMouseInteractive) return;
 
+    g_overlayMouseInteractive = interactive;
     LONG_PTR style = GetWindowLongPtr(Window, GWL_EXSTYLE);
-    if (ShowMenu)
-        style &= ~(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
+    if (interactive)
+        style &= ~WS_EX_TRANSPARENT;
     else
-        style |= WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+        style |= WS_EX_TRANSPARENT;
     SetWindowLongPtr(Window, GWL_EXSTYLE, style);
     SetWindowPos(Window, NULL, 0, 0, 0, 0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-    if (ShowMenu && IsGameOrOverlayForeground()) {
-        SetForegroundWindow(Window);
-    } else if (!ShowMenu) {
-        if (GetCapture() == Window) ReleaseCapture();
-        if (GetForegroundWindow() == Window) SetForegroundWindow(hwnd);
-    }
-    previousMenuState = ShowMenu;
 }
 
 static bool ResetD3dDevice() {
@@ -623,7 +634,7 @@ static bool ResetD3dDevice() {
 }
 
 void SubmitDrawCalls() {
-    FlushOverlayPipeline(Esp_box, cornered_box, Esp_line, Esp_Distance, VisDist,
+    FlushOverlayPipeline(Width, Height, Esp_box, cornered_box, Esp_line, Esp_Distance, VisDist,
                    playerTrail, Aimbot, AimFOV, smooth, hitboxpos,
                    fovcircle, square_fov, crosshair);
 }
@@ -717,6 +728,10 @@ void render() {
             ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
         ImGui::Begin(px33_get_menu_title(), &ShowMenu,
             ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoCollapse);
+        const ImVec2 menuPos = ImGui::GetWindowPos();
+        const ImVec2 menuSize = ImGui::GetWindowSize();
+        g_menuBounds = { static_cast<LONG>(menuPos.x), static_cast<LONG>(menuPos.y),
+            static_cast<LONG>(menuPos.x + menuSize.x), static_cast<LONG>(menuPos.y + menuSize.y) };
 
         ImGui::BeginTabBar("##px33tabs");
 
@@ -990,6 +1005,7 @@ void render() {
         ImGui::EndTabBar();
         ImGui::End();
     }
+    UpdateOverlayInteractivity();
 
     SubmitDrawCalls();
 
@@ -1015,6 +1031,7 @@ void xMainLoop() {
     GetGameClientBounds(&oldBounds);
     ZeroMemory(&Message, sizeof(MSG));
     while (Message.message != WM_QUIT) {
+        UpdateOverlayInteractivity();
         while (PeekMessage(&Message, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&Message);
             DispatchMessage(&Message);
@@ -1056,7 +1073,7 @@ void xMainLoop() {
 
 LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     if (ImGui_ImplWin32_WndProcHandler(hWnd, message, wParam, lParam)) return 1;
-    if (message == WM_MOUSEACTIVATE && ShowMenu) return MA_ACTIVATE;
+    if (message == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
     if (message == WM_DESTROY) {
         PostQuitMessage(0);
         return 0;

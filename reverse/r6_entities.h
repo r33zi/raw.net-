@@ -879,10 +879,9 @@ static void PollSyncBuffer(int W, int H, int maxD) {
     }
 }
 
-static void FlushOverlayPipeline(bool box, bool corner, bool line, bool dist, int visDist,
+static void FlushOverlayPipeline(int W, int H, bool box, bool corner, bool line, bool dist, int visDist,
                             bool trail, bool aimEnabled, float aimFov, float aimSmooth,
                             int hitboxSel, bool fovCircle, bool squareFov, bool xhair) {
-    int W = GetSystemMetrics(SM_CXSCREEN), H = GetSystemMetrics(SM_CYSCREEN);
     CaptureProjectionFrame();
     PollSyncBuffer(W, H, visDist);
     std::lock_guard<std::mutex> lk(g_Mtx);
