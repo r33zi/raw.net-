@@ -225,11 +225,27 @@ namespace skel
     inline uint64_t FindCharacterComponent(uint64_t entity, float dx = 0.f, float dy = 0.f, float dz = 0.f)
     {
         if (!ValidPtr(entity)) return 0;
-        g_componentArrayOffset = 0xE0;
-        g_compIdxOff = 0x1EF;
+
+        // Keep the component-list offset discovered by skad.  Resetting it to
+        // the legacy 0xE0 value here discarded a successful runtime discovery
+        // before the next player could use it, so every bone read fell back to
+        // a stale component list.
         const uint64_t list = Read<uint64_t>(entity + g_componentArrayOffset);
-        const uint8_t index = Read<uint8_t>(entity + g_compIdxOff);
         if (!ValidPtr(list)) return 0;
+
+        // Prefer the component whose live transform matches this actor.  The
+        // component index is build-dependent, while this check identifies the
+        // character component directly and also seeds the tag cache used by
+        // subsequent actors.
+        if (const uint64_t character = ScanListForCharacter(list, dx, dy, dz))
+            return character;
+
+        // Retain the indexed lookup as a cheap fallback for builds where the
+        // live-position field is unavailable.  Bound the index to the list
+        // range scanned above so corrupt entity data cannot probe arbitrary
+        // process memory.
+        const uint8_t index = Read<uint8_t>(entity + g_compIdxOff);
+        if (index >= 200) return 0;
         const uint64_t component = Read<uint64_t>(list + (uint64_t)index * 8);
         if (!ValidPtr(component) ||
             (component >= g_imageBase && component - g_imageBase < g_imageSize)) return 0;

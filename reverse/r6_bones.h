@@ -567,10 +567,21 @@ static bool ReadSkeleton_Impl(uint64_t entity, float wx, float wy, float wz, Ske
 
     // Only live animation sources are accepted. Synthetic silhouettes and
     // static bind poses would look plausible but would not track articulation.
-    bool r;
-    r = ReadSkeleton_Direct(entity, wx, wy, wz, s);
+    bool r = ReadSkeleton_Direct(entity, wx, wy, wz, s);
     if (r) return true;
     memset(&s, 0, sizeof(s));
+
+    // Preserve a currently working component-list offset.  If the direct
+    // hash path misses, learn the current build layout and retry it once so
+    // the newly discovered offset is available immediately instead of on a
+    // later entity update.
+    const uint64_t previousComponentArrayOffset = skel::g_componentArrayOffset;
+    skad::CastDiscoveryVote(entity, wx, wy, wz);
+    if (skel::g_componentArrayOffset != previousComponentArrayOffset) {
+        r = ReadSkeleton_Direct(entity, wx, wy, wz, s);
+        if (r) return true;
+        memset(&s, 0, sizeof(s));
+    }
 
     r = ReadSkeleton_ByRegistry(entity, s);
     if (r) return true;
