@@ -3,6 +3,7 @@
 #include "d3d9_x.h"
 #include "xor.hpp"
 #include <dwmapi.h>
+#include <windowsx.h>
 #include <vector>
 #include <random>
 #include <cctype>
@@ -133,6 +134,8 @@ static HWND Window = NULL;
 static HWND g_medalWindow = NULL;
 static RECT g_menuBounds = {};
 static bool g_menuMouseHeld = false;
+static bool g_menuMouseDown[3] = {};
+static bool g_menuMousePressed[3] = {};
 static bool g_overlayMouseInteractive = false;
 static const char* g_overlayClassName = "PasterSixMedalOverlay";
 IDirect3D9Ex* p_Object = NULL;
@@ -580,22 +583,32 @@ static int g_menuTab = 0;
 
 static void UpdateOverlayInput() {
     ImGuiIO& io = ImGui::GetIO();
-    POINT cursor;
-    if (GetCursorPos(&cursor) && ScreenToClient(Window, &cursor))
+    POINT cursor = {};
+    const bool cursorValid = GetCursorPos(&cursor) && ScreenToClient(Window, &cursor);
+    if (cursorValid)
         io.MousePos = ImVec2(static_cast<float>(cursor.x), static_cast<float>(cursor.y));
     else
         io.MousePos = ImVec2(-FLT_MAX, -FLT_MAX);
 
     static bool previousDown[3] = {};
-    static bool menuOwned[3] = {};
     const int buttons[3] = { VK_LBUTTON, VK_RBUTTON, VK_MBUTTON };
     g_menuMouseHeld = false;
     for (int button = 0; button < 3; ++button) {
         const bool down = (GetAsyncKeyState(buttons[button]) & 0x8000) != 0;
-        if (!down || !ShowMenu) menuOwned[button] = false;
-        else if (!previousDown[button]) menuOwned[button] = g_overlayMouseInteractive;
-        io.MouseDown[button] = down && menuOwned[button];
+        if (!ShowMenu) {
+            g_menuMouseDown[button] = false;
+            g_menuMousePressed[button] = false;
+        } else {
+            if (down && !previousDown[button] && !g_menuMouseDown[button] &&
+                cursorValid && PtInRect(&g_menuBounds, cursor)) {
+                g_menuMouseDown[button] = true;
+                g_menuMousePressed[button] = true;
+            }
+            if (!down) g_menuMouseDown[button] = false;
+        }
+        io.MouseDown[button] = ShowMenu && (g_menuMouseDown[button] || g_menuMousePressed[button]);
         g_menuMouseHeld |= io.MouseDown[button];
+        g_menuMousePressed[button] = false;
         previousDown[button] = down;
     }
 }
@@ -1072,7 +1085,23 @@ void xMainLoop() {
 }
 
 LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
-    if (ImGui_ImplWin32_WndProcHandler(hWnd, message, wParam, lParam)) return 1;
+    const LRESULT handled = ImGui_ImplWin32_WndProcHandler(hWnd, message, wParam, lParam);
+    int button = -1;
+    if (message == WM_LBUTTONDOWN || message == WM_LBUTTONDBLCLK || message == WM_LBUTTONUP) button = 0;
+    if (message == WM_RBUTTONDOWN || message == WM_RBUTTONDBLCLK || message == WM_RBUTTONUP) button = 1;
+    if (message == WM_MBUTTONDOWN || message == WM_MBUTTONDBLCLK || message == WM_MBUTTONUP) button = 2;
+    if (button >= 0) {
+        if (message == WM_LBUTTONUP || message == WM_RBUTTONUP || message == WM_MBUTTONUP) {
+            g_menuMouseDown[button] = false;
+        } else {
+            const POINT click = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            if (ShowMenu && PtInRect(&g_menuBounds, click) && !g_menuMouseDown[button]) {
+                g_menuMouseDown[button] = true;
+                g_menuMousePressed[button] = true;
+            }
+        }
+    }
+    if (handled) return handled;
     if (message == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
     if (message == WM_DESTROY) {
         PostQuitMessage(0);
