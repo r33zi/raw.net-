@@ -22,6 +22,7 @@
     <ClInclude Include="ud.h" />
     <ClInclude Include="Keybind.h" />
     <ClInclude Include="offsets.h" />
+    <ClInclude Include="build_118144515.h" />
     <ClInclude Include="FVector.h" />
     <ClInclude Include="Skicript.hpp" />
     <ClInclude Include="xstring.h" />
