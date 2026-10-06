@@ -8,6 +8,25 @@
 #include "driver.h"
 #include "offsets.h"
 
+// Diagnostic validation only: these signatures do not establish the file hash
+// or provide decoders for the encoded fields in the build metadata.
+static void ValidateBuild118144515Entries(uint64_t moduleBase, uint64_t moduleSize) {
+    size_t matched = 0;
+    for (const auto& entry : Build118144515::CodeEntries) {
+        const bool valid = Build118144515::ValidateCodeEntry(entry, moduleBase,
+            moduleSize, [](uint64_t address, void* data, size_t bytes) {
+                return driver->ReadProcessMemory(address, data,
+                    static_cast<DWORD>(bytes)) == 0;
+            });
+        if (valid) ++matched;
+        else printf("[BUILD] %s RVA 0x%X: mismatch, unreadable, or outside module\n",
+            entry.name, entry.rva);
+    }
+    printf("[BUILD] HUD %u: %zu/%zu entry signatures match (file hash unverified)\n",
+        Build118144515::HUD, matched,
+        sizeof(Build118144515::CodeEntries) / sizeof(Build118144515::CodeEntries[0]));
+}
+
 static std::vector<int> ParsePattern(const char* pat) {
     std::vector<int> v;
     const char* p = pat;

@@ -614,6 +614,7 @@ static void AppendTrailSample(TrailBuffer* t, Vec3 pos) {
 static bool InitRenderPipeline(uint64_t base, uint64_t size) {
     g_imageBase=base;
     g_imageSize=size;
+    ValidateBuild118144515Entries(base, size);
     auto secs=GetPESections(base);
     if(secs.empty()) return false;
     if(!CacheTextSection(base,secs)) return false;

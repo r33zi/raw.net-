@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include "build_118144515.h"
 
 namespace OFFSETS
 {

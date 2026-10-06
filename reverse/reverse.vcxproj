@@ -165,6 +165,7 @@
     <ClInclude Include="FVector.h" />
     <ClInclude Include="Keybind.h" />
     <ClInclude Include="offsets.h" />
+    <ClInclude Include="build_118144515.h" />
     <ClInclude Include="pasterx.h" />
     <ClInclude Include="r6_entities.h" />
     <ClInclude Include="r6_bone_ids.h" />
