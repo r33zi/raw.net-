@@ -138,9 +138,9 @@ static bool g_menuMouseDown[3] = {};
 static bool g_menuMousePressed[3] = {};
 static bool g_overlayMouseInteractive = false;
 static const char* g_overlayClassName = "PasterSixMedalOverlay";
-IDirect3D9Ex* p_Object = NULL;
+IDirect3D9* p_Object = NULL;
 static LPDIRECT3DDEVICE9 D3dDevice = NULL;
-static LPDIRECT3DVERTEXBUFFER9 TriBuf = NULL;
+static bool g_deviceResetPending = false;
 
 typedef struct { float X, Y, Z; } FVector;
 typedef struct { float X, Y; } FVector2D;
@@ -470,20 +470,24 @@ bool xCreateWindow() {
 }
 
 bool xInitD3d() {
-    if (FAILED(Direct3DCreate9Ex(D3D_SDK_VERSION, &p_Object))) return false;
+    p_Object = Direct3DCreate9(D3D_SDK_VERSION);
+    if (!p_Object) return false;
     ZeroMemory(&d3dpp, sizeof(d3dpp));
     d3dpp.BackBufferWidth = Width;
     d3dpp.BackBufferHeight = Height;
     d3dpp.BackBufferFormat = D3DFMT_A8R8G8B8;
     d3dpp.MultiSampleType = D3DMULTISAMPLE_NONE;
-    d3dpp.AutoDepthStencilFormat = D3DFMT_D16;
     d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-    d3dpp.EnableAutoDepthStencil = TRUE;
+    d3dpp.EnableAutoDepthStencil = FALSE;
     d3dpp.hDeviceWindow = Window;
     d3dpp.Windowed = TRUE;
     d3dpp.PresentationInterval = D3DPRESENT_INTERVAL_ONE;
-    if (FAILED(p_Object->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, Window,
-        D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &D3dDevice))) {
+    HRESULT created = p_Object->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, Window,
+        D3DCREATE_HARDWARE_VERTEXPROCESSING, &d3dpp, &D3dDevice);
+    if (FAILED(created))
+        created = p_Object->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, Window,
+            D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &D3dDevice);
+    if (FAILED(created)) {
         p_Object->Release();
         p_Object = nullptr;
         return false;
@@ -555,6 +559,13 @@ bool xInitD3d() {
     XorS(font, "C:\\Windows\\Fonts\\tahoma.ttf");
     m_pFont = io.Fonts->AddFontFromFileTTF(font.decrypt(), 13.0f, nullptr, io.Fonts->GetGlyphRangesDefault());
     if (m_pFont == nullptr) m_pFont = io.Fonts->AddFontDefault();
+    if (!ImGui_ImplDX9_CreateDeviceObjects()) {
+        ImGui_ImplDX9_Shutdown();
+        ImGui_ImplWin32_Shutdown();
+        ImGui::DestroyContext();
+        return false;
+    }
+    LoadShaderResources(D3dDevice);
     p_Object->Release(); p_Object = nullptr;
     return true;
 }
@@ -600,7 +611,8 @@ static void UpdateOverlayInput() {
             g_menuMousePressed[button] = false;
         } else {
             if (down && !previousDown[button] && !g_menuMouseDown[button] &&
-                cursorValid && PtInRect(&g_menuBounds, cursor)) {
+                cursorValid && (PtInRect(&g_menuBounds, cursor) ||
+                    io.WantCaptureMouse || GetCapture() == Window)) {
                 g_menuMouseDown[button] = true;
                 g_menuMousePressed[button] = true;
             }
@@ -636,19 +648,16 @@ static void UpdateOverlayInteractivity() {
 static bool ResetD3dDevice() {
     if (!D3dDevice) return false;
 
-    ReleaseShaderResources();
     ImGui_ImplDX9_InvalidateDeviceObjects();
     const HRESULT result = D3dDevice->Reset(&d3dpp);
     if (FAILED(result)) return false;
 
-    ImGui_ImplDX9_CreateDeviceObjects();
-    LoadShaderResources(D3dDevice);
-    return true;
+    return ImGui_ImplDX9_CreateDeviceObjects();
 }
 
 void SubmitDrawCalls() {
     FlushOverlayPipeline(Width, Height, Esp_box, cornered_box, Esp_line, Esp_Distance, VisDist,
-                   playerTrail, Aimbot, AimFOV, smooth, hitboxpos,
+                   playerTrail, Aimbot && !ShowMenu, AimFOV, smooth, hitboxpos,
                    fovcircle, square_fov, crosshair);
 }
 
@@ -722,14 +731,7 @@ void render() {
     ImGui::NewFrame();
     UpdateRainbow();
 
-    
-    {
-        static bool s_iconsInitAttempted = false;
-        if (!s_iconsInitAttempted && D3dDevice) {
-            LoadShaderResources(D3dDevice);
-            s_iconsInitAttempted = true;
-        }
-    }
+    g_renderSnapshot = g_collectionWorker.Latest();
 
     if (ShowMenu) {
         static int selectedBone = 0;
@@ -746,7 +748,7 @@ void render() {
         g_menuBounds = { static_cast<LONG>(menuPos.x), static_cast<LONG>(menuPos.y),
             static_cast<LONG>(menuPos.x + menuSize.x), static_cast<LONG>(menuPos.y + menuSize.y) };
 
-        ImGui::BeginTabBar("##px33tabs");
+        if (ImGui::BeginTabBar("##px33tabs")) {
 
         
         if (ImGui::BeginTabItem("Aimbot")) {
@@ -894,13 +896,14 @@ void render() {
 
             ImGui::Separator();
             if (ImGui::Button("Rescan Entities", ImVec2(200, 25))) {
-                g_nextArmTick = 0;
-                g_fallbackArray = 0;
-                { std::lock_guard<std::mutex> l(g_frameMtx); g_capturedFrames.clear(); }
-                FlushSyncBuffer();
+                ++g_collectionRequest.rescan;
             }
             ImGui::SameLine();
-            ImGui::Text("E:%d P:%d", g_vtxCount, g_activeVtx);
+            ImGui::Text("E:%d P:%d", g_renderSnapshot ? (int)g_renderSnapshot->vertices.size() : 0,
+                g_renderSnapshot ? g_renderSnapshot->activeVertices : 0);
+            ImGui::Text("Menu: %.1f FPS", ImGui::GetIO().Framerate);
+            if (!g_pipelineReady || g_collectionWorker.Failed())
+                ImGui::TextUnformatted("Game data unavailable");
 
             ImGui::PushItemWidth(220.0f);
             ImGui::PopItemWidth();
@@ -976,7 +979,7 @@ void render() {
             ImGui::Separator();
             ImGui::Text("Base: 0x%llX", (unsigned long long)base_address);
             ImGui::Text("PID: %lu", processID);
-            ImGui::Text("Entity Cache: %d", (int)g_syncMap.size());
+            ImGui::Text("Entity Cache: %d", g_renderSnapshot ? (int)g_renderSnapshot->cacheSize : 0);
             if (g_shaderResReady)
                 ImGui::Text("Op Icons: %d/%d loaded", g_shaderResLoaded, g_opIconCount);
             ImGui::Separator();
@@ -1007,7 +1010,7 @@ void render() {
             }
             if (g_weatherMode != WFX_NONE) {
                 ImGui::SliderFloat("Intensity##wfx", &g_wfxIntensity, 0.1f, 1.0f, "%.1f");
-                g_wfxIntensity = g_weatherIntensity;
+                g_weatherIntensity = g_wfxIntensity;
                 ImGui::SliderFloat("Wind##wfx", &g_wfxWindX, -2.0f, 2.0f, "%.1f");
                 g_weatherWind = g_wfxWindX;
             }
@@ -1016,10 +1019,20 @@ void render() {
         }
 
         ImGui::EndTabBar();
+        }
         ImGui::End();
     }
     UpdateOverlayInteractivity();
 
+    g_collectionRequest.width = Width;
+    g_collectionRequest.height = Height;
+    g_collectionRequest.maxDistance = VisDist;
+    g_collectionRequest.active = true;
+    g_collectionRequest.skeleton = Esp_skeleton || skeletonAim;
+    g_collectionRequest.labels = shaderLabelOverlay;
+    g_collectionRequest.sidewards = sidewardsEnabled;
+    g_collectionRequest.sidewardsValue = sidewardsValue;
+    g_collectionWorker.SetRequest(g_collectionRequest);
     SubmitDrawCalls();
 
     ImGui::EndFrame();
@@ -1033,52 +1046,76 @@ void render() {
         D3dDevice->EndScene();
     }
     HRESULT result = D3dDevice->Present(nullptr, nullptr, nullptr, nullptr);
-    if (result == D3DERR_DEVICELOST && D3dDevice->TestCooperativeLevel() == D3DERR_DEVICENOTRESET) {
-        ResetD3dDevice();
-    }
+    if (result == D3DERR_DEVICELOST) g_deviceResetPending = true;
 }
 
 MSG Message = { NULL };
 void xMainLoop() {
     RECT oldBounds = {};
     GetGameClientBounds(&oldBounds);
+    bool visible = true;
+    if (g_pipelineReady && !g_collectionWorker.Start(g_collectionRequest,
+            ENTITY_UPDATE_INTERVAL, CollectOverlaySnapshot))
+        printf("[!] Could not start game-data worker; menu remains available\n");
     ZeroMemory(&Message, sizeof(MSG));
     while (Message.message != WM_QUIT) {
         UpdateOverlayInteractivity();
         while (PeekMessage(&Message, nullptr, 0, 0, PM_REMOVE)) {
+            if (Message.message == WM_QUIT) break;
             TranslateMessage(&Message);
             DispatchMessage(&Message);
         }
-        if (Message.message == WM_QUIT) break;
-        if (!IsWindow(Window)) break;
-        if (IsGameOrOverlayForeground()) {
-            SetWindowPos(Window, HWND_TOPMOST, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        } else {
-            ShowWindow(Window, SW_HIDE);
-        }
+        if (Message.message == WM_QUIT || !IsWindow(Window) || !IsWindow(hwnd)) break;
         if (GetAsyncKeyState(VK_END) & 1) break;
+
+        const bool shouldShow = IsGameOrOverlayForeground() && !IsIconic(hwnd);
+        if (shouldShow != visible) {
+            if (shouldShow)
+                SetWindowPos(Window, HWND_TOPMOST, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            else
+                ShowWindow(Window, SW_HIDE);
+            visible = shouldShow;
+        }
+        if (!visible) {
+            g_collectionRequest.active = false;
+            g_collectionWorker.SetRequest(g_collectionRequest);
+            MsgWaitForMultipleObjectsEx(0, nullptr, 50, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            continue;
+        }
 
         RECT bounds = {};
         if (GetGameClientBounds(&bounds) && !EqualRect(&bounds, &oldBounds)) {
             const int newWidth = bounds.right - bounds.left;
             const int newHeight = bounds.bottom - bounds.top;
             const bool sizeChanged = newWidth != Width || newHeight != Height;
-
             oldBounds = bounds;
             SetWindowPos(Window, HWND_TOPMOST, bounds.left, bounds.top, newWidth, newHeight,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW);
-
-            if (sizeChanged && newWidth > 0 && newHeight > 0) {
+                SWP_NOACTIVATE);
+            if (sizeChanged) {
                 Width = newWidth;
                 Height = newHeight;
                 d3dpp.BackBufferWidth = Width;
                 d3dpp.BackBufferHeight = Height;
-                ResetD3dDevice();
+                g_deviceResetPending = true;
             }
         }
+
+        // Lost devices must not receive new frames. Keep pumping input and retry
+        // failed resize resets even when TestCooperativeLevel returns D3D_OK.
+        const HRESULT state = D3dDevice->TestCooperativeLevel();
+        if (state == D3DERR_DEVICENOTRESET) g_deviceResetPending = true;
+        if ((state != D3D_OK && state != D3DERR_DEVICENOTRESET) ||
+            (g_deviceResetPending && !ResetD3dDevice())) {
+            g_collectionRequest.active = false;
+            g_collectionWorker.SetRequest(g_collectionRequest);
+            MsgWaitForMultipleObjectsEx(0, nullptr, 50, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            continue;
+        }
+        g_deviceResetPending = false;
         render();
     }
+    g_collectionWorker.Stop();
     ImGui_ImplDX9_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
@@ -1095,7 +1132,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
             g_menuMouseDown[button] = false;
         } else {
             const POINT click = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-            if (ShowMenu && PtInRect(&g_menuBounds, click) && !g_menuMouseDown[button]) {
+            if (ShowMenu && ImGui::GetCurrentContext() && (PtInRect(&g_menuBounds, click) ||
+                    ImGui::GetIO().WantCaptureMouse || GetCapture() == hWnd) &&
+                    !g_menuMouseDown[button]) {
                 g_menuMouseDown[button] = true;
                 g_menuMousePressed[button] = true;
             }
@@ -1113,7 +1152,6 @@ LRESULT CALLBACK OverlayWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
 void xShutdown() {
     ShutdownRenderPipeline();
     ReleaseShaderResources();
-    if (TriBuf) { TriBuf->Release(); TriBuf = nullptr; }
     if (D3dDevice) { D3dDevice->Release(); D3dDevice = nullptr; }
     if (p_Object) { p_Object->Release(); p_Object = nullptr; }
 

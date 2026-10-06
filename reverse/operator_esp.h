@@ -94,11 +94,11 @@ static bool g_shaderResReady = false;
 
 static bool UploadShaderResource(IDirect3DDevice9* device, const uint8_t* rgba, int w, int h, IDirect3DTexture9** outTex) {
     if (!device || !rgba || !outTex) return false;
-    HRESULT hr = device->CreateTexture(w, h, 1, D3DUSAGE_DYNAMIC, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, outTex, NULL);
+    HRESULT hr = device->CreateTexture(w, h, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, outTex, NULL);
     if (FAILED(hr)) return false;
 
     D3DLOCKED_RECT lr;
-    hr = (*outTex)->LockRect(0, &lr, NULL, D3DLOCK_DISCARD);
+    hr = (*outTex)->LockRect(0, &lr, NULL, 0);
     if (FAILED(hr)) { (*outTex)->Release(); *outTex = nullptr; return false; }
 
     for (int y = 0; y < h; y++) {
@@ -142,7 +142,7 @@ static void ReleaseShaderResources() {
 
 static ImTextureID QueryShaderResource(const char* opName) {
     if (!opName || !opName[0] || !g_shaderResReady) return nullptr;
-    for (int i = 0; i < g_opIconCount && i < g_shaderResLoaded; i++) {
+    for (int i = 0; i < g_opIconCount && i < 128; i++) {
         if (_stricmp(g_opIconTable[i].name, opName) == 0)
             return (ImTextureID)g_shaderResourceTex[i];
     }
