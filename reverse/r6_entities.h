@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include "frame_position.h"
+#include "async_snapshot.h"
 struct Vec3 { float x, y, z; };
 static uint64_t g_imageBase = 0;
 static uint64_t g_imageSize = 0;
@@ -159,9 +160,9 @@ static void DBG(const char* fmt, ...) {
 }
 
 static uint64_t g_projectionAddr = 0;
-static Matrix4x4 g_frameProjection{};
-static Vec3 g_frameCamera{};
-static bool g_frameProjectionValid = false;
+static thread_local Matrix4x4 g_frameProjection{};
+static thread_local Vec3 g_frameCamera{};
+static thread_local bool g_frameProjectionValid = false;
 static uint64_t g_frameSyncAddr = 0;
 static uint64_t g_ShellPage = 0;
 static uint64_t g_RingAddr = 0;
@@ -177,7 +178,8 @@ static constexpr DWORD COLLECT_MS = 2000;
 static constexpr DWORD REARM_MS = 1000;
 
 static std::vector<OverlayVertex> g_vertexBuffer;
-static std::mutex g_Mtx;
+static bool g_pipelineReady = false;
+static int g_roundState = -1;
 static int g_vtxCount = 0, g_activeVtx = 0;
 static std::unordered_set<uint64_t> g_capturedFrames;
 static std::mutex g_frameMtx;
@@ -196,12 +198,32 @@ static CaptureStats g_captureStats;
 static uint64_t g_RoundPtr = 0;
 static bool g_RoundFound = false;
 
-static DWORD g_lastEntityUpdate = 0;
-// Keep costly driver reads and skeleton reconstruction off the render cadence.
-// The overlay (including the menu) still renders at the presentation rate while
-// entity data is refreshed often enough for smooth interpolation.
-static constexpr DWORD ENTITY_UPDATE_INTERVAL = 33;
+struct CollectionRequest {
+    int width = 0, height = 0, maxDistance = 250;
+    bool active = false, skeleton = false, labels = false;
+    bool sidewards = false;
+    float sidewardsValue = 10.0f;
+    uint64_t rescan = 0;
+};
 
+struct OverlaySnapshot {
+    std::vector<OverlayVertex> vertices;
+    Matrix4x4 projection{};
+    Vec3 camera{};
+    bool projectionValid = false, captureActive = false;
+    int activeVertices = 0, round = -1;
+    int width = 0, height = 0;
+    size_t cacheSize = 0;
+    uint64_t totalFrames = 0;
+    CaptureStats stats{};
+    std::chrono::steady_clock::time_point collectedAt{};
+};
+
+static AsyncSnapshot<CollectionRequest, OverlaySnapshot> g_collectionWorker;
+// Render-thread state. Collection never accesses these objects.
+static CollectionRequest g_collectionRequest;
+static std::shared_ptr<const OverlaySnapshot> g_renderSnapshot;
+static constexpr auto ENTITY_UPDATE_INTERVAL = std::chrono::milliseconds(33);
 
 static std::unordered_map<uint64_t, RenderSyncEntry> g_syncMap;
 static std::mutex g_syncMapMtx;
@@ -658,18 +680,21 @@ static bool InitRenderPipeline(uint64_t base, uint64_t size) {
         return 0;
     }, NULL, 0, NULL);
 
-    CreateThread(NULL, 0, [](LPVOID) -> DWORD { ScanSidewards(); return 0; }, NULL, 0, NULL);
 
+    g_pipelineReady = true;
     printf("[R6] Position system: indexed skeleton component, paired positions\n");
     return true;
 }
 
 static void ShutdownRenderPipeline() {
+    g_collectionWorker.Stop();
+    g_pipelineReady = false;
     if(g_frameSyncActive && !DetachFrameSync())
         printf("[HOOK] Restore failed; keeping capture allocation live\n");
     if (g_registryScanThread) {
-        if (WaitForSingleObject(g_registryScanThread, 2000) == WAIT_OBJECT_0)
-            CloseHandle(g_registryScanThread);
+        // Do not close logs/caches while the registry scan can still use them.
+        WaitForSingleObject(g_registryScanThread, INFINITE);
+        CloseHandle(g_registryScanThread);
         g_registryScanThread = NULL;
     }
     RestoreSidewards();
@@ -678,12 +703,9 @@ static void ShutdownRenderPipeline() {
     if(g_log){fclose(g_log);g_log=nullptr;}
 }
 
-static void PollSyncBuffer(int W, int H, int maxD) {
+static void PollSyncBuffer(const CollectionRequest& request) {
+    const int W = request.width, H = request.height, maxD = request.maxDistance;
     DWORD now_tick = GetTickCount();
-    if (now_tick - g_lastEntityUpdate < ENTITY_UPDATE_INTERVAL) return;
-    g_lastEntityUpdate = now_tick;
-
-    std::lock_guard<std::mutex> lk(g_Mtx);
     g_vertexBuffer.clear(); g_vtxCount = 0; g_activeVtx = 0;
 
     static DWORD s_posDbg = 0;
@@ -691,10 +713,9 @@ static void PollSyncBuffer(int W, int H, int maxD) {
     if (posDbg) s_posDbg = now_tick;
     if (!g_RoundFound) FindRound();
     int rs = g_RoundFound ? ReadRound() : 3;
+    g_roundState = g_RoundFound ? rs : -1;
 
     static int s_lastRoundState = -1;
-    extern bool sidewardsEnabled;
-    extern float sidewardsValue;
 
     bool isGameplay = (rs == 2 || rs == 3);
     bool wasGameplay = (s_lastRoundState == 2 || s_lastRoundState == 3);
@@ -702,9 +723,9 @@ static void PollSyncBuffer(int W, int H, int maxD) {
 
     if (newRound) {
         printf("[ROUND] New round (rs=%d, prev=%d), waiting before hook...\\n", rs, s_lastRoundState);
-        CreateThread(NULL, 0, [](LPVOID) -> DWORD { ScanSidewards(); return 0; }, NULL, 0, NULL);
-        if (sidewardsEnabled && g_Sidewards.found) {
-            SetSidewardsValue(sidewardsValue);
+        if (request.sidewards) {
+            ScanSidewards();
+            SetSidewardsValue(request.sidewardsValue);
         }
         g_nextArmTick = now_tick + 4000;
         g_captureStats = {};
@@ -848,7 +869,7 @@ static void PollSyncBuffer(int W, int H, int maxD) {
             e.hp = 100;
             e.operatorName[0] = '\0';
 
-            if ((Esp_skeleton || skeletonAim) && e.isPlayer &&
+            if (request.skeleton && e.isPlayer &&
                 ReadSkeleton(ea, draw_pos.x, draw_pos.y, draw_pos.z, e.bones) &&
                 e.bones.total > 0) {
                 e.hasBones = true;
@@ -858,7 +879,7 @@ static void PollSyncBuffer(int W, int H, int maxD) {
             }
 
 
-            const char* opName = ResolveShaderLabel(ea);
+            const char* opName = request.labels ? ResolveShaderLabel(ea) : nullptr;
             if (opName) {
                 strncpy(e.operatorName, opName, sizeof(e.operatorName) - 1);
                 e.operatorName[sizeof(e.operatorName) - 1] = '\0';
@@ -880,12 +901,53 @@ static void PollSyncBuffer(int W, int H, int maxD) {
     }
 }
 
+static OverlaySnapshot CollectOverlaySnapshot(const CollectionRequest& request) {
+    OverlaySnapshot snapshot;
+    if (!g_pipelineReady) return snapshot;
+    if (!request.active || request.width <= 0 || request.height <= 0) {
+        if (g_frameSyncActive) DetachFrameSync();
+        return snapshot;
+    }
+
+    static uint64_t lastRescan = 0;
+    if (request.rescan != lastRescan) {
+        lastRescan = request.rescan;
+        g_nextArmTick = 0;
+        g_fallbackArray = 0;
+        { std::lock_guard<std::mutex> lock(g_frameMtx); g_capturedFrames.clear(); }
+        FlushSyncBuffer();
+    }
+    snapshot.collectedAt = std::chrono::steady_clock::now();
+    snapshot.width = request.width;
+    snapshot.height = request.height;
+    CaptureProjectionFrame();
+    PollSyncBuffer(request);
+    snapshot.vertices = g_vertexBuffer;
+    snapshot.projection = g_frameProjection;
+    snapshot.camera = g_frameCamera;
+    snapshot.projectionValid = g_frameProjectionValid;
+    snapshot.captureActive = g_frameSyncActive;
+    snapshot.activeVertices = g_activeVtx;
+    snapshot.round = g_roundState;
+    snapshot.cacheSize = g_syncMap.size();
+    snapshot.totalFrames = g_totalFrames.load();
+    snapshot.stats = g_captureStats;
+    return snapshot;
+}
+
 static void FlushOverlayPipeline(int W, int H, bool box, bool corner, bool line, bool dist, int visDist,
                             bool trail, bool aimEnabled, float aimFov, float aimSmooth,
                             int hitboxSel, bool fovCircle, bool squareFov, bool xhair) {
-    CaptureProjectionFrame();
-    PollSyncBuffer(W, H, visDist);
-    std::lock_guard<std::mutex> lk(g_Mtx);
+    (void)visDist;
+    static const OverlaySnapshot empty;
+    const OverlaySnapshot& frame = g_renderSnapshot ? *g_renderSnapshot : empty;
+    // Never draw/act on an indefinitely stale frame after a read stalls or fails.
+    const bool fresh = std::chrono::steady_clock::now() - frame.collectedAt <
+        std::chrono::milliseconds(250);
+    g_frameProjection = frame.projection;
+    g_frameCamera = frame.camera;
+    g_frameProjectionValid = fresh && frame.projectionValid &&
+        frame.width == W && frame.height == H;
     ImDrawList* dl = ImGui::GetOverlayDrawList();
     if (!dl) return;
 
@@ -915,7 +977,8 @@ static void FlushOverlayPipeline(int W, int H, bool box, bool corner, bool line,
     extern bool rainbowSnaplines;
     extern bool rainbowTrail;
 
-    for (auto& e : g_vertexBuffer) {
+    for (const auto& e : frame.vertices) {
+        if (!g_frameProjectionValid) break;
         if (!e.onScreen) continue;
         float sx = e.screenPos.x, sy = e.screenPos.y;
         float entOffset = (float)(e.instance & 0xFF) / 255.0f;
@@ -1178,7 +1241,7 @@ static void FlushOverlayPipeline(int W, int H, bool box, bool corner, bool line,
 
     {
         extern int g_weatherMode;
-        if (g_weatherMode != WFX_NONE && g_projectionAddr) {
+        if (g_weatherMode != WFX_NONE && g_frameProjectionValid) {
             g_wfxMode = g_weatherMode;
             Vec3 cam_w = QueryCameraOrigin();
             if (fabsf(cam_w.x) > 0.1f || fabsf(cam_w.y) > 0.1f) {
@@ -1202,29 +1265,29 @@ static void FlushOverlayPipeline(int W, int H, bool box, bool corner, bool line,
 
     char info[256];
     snprintf(info, 256, "P:%d E:%d Hook:%s Rnd:%d Cache:%d",
-        g_activeVtx, g_vtxCount, g_frameSyncActive ? "ON" : "gap",
-        g_RoundFound ? ReadRound() : -1,
-        (int)g_syncMap.size());
+        frame.activeVertices, (int)frame.vertices.size(), frame.captureActive ? "ON" : "gap",
+        frame.round,
+        (int)frame.cacheSize);
     dl->AddText({10, 10}, IM_COL32(0, 255, 0, 200), info);
     char diagnostics[256];
     snprintf(diagnostics, sizeof(diagnostics),
         "ring: ok %llu | bad addr %llu | bad vtable %llu | bad id %llu",
-        (unsigned long long)g_captureStats.ringOk,
-        (unsigned long long)g_captureStats.badAddr,
-        (unsigned long long)g_captureStats.badVtable,
-        (unsigned long long)g_captureStats.badId);
+        (unsigned long long)frame.stats.ringOk,
+        (unsigned long long)frame.stats.badAddr,
+        (unsigned long long)frame.stats.badVtable,
+        (unsigned long long)frame.stats.badId);
     dl->AddText({10, 28}, IM_COL32(0, 255, 0, 200), diagnostics);
     snprintf(diagnostics, sizeof(diagnostics),
         "dropped at capture %llu (last cls 0x%03X) | Captured %llu | SyncMap %zu | Vtx %d",
-        (unsigned long long)g_captureStats.droppedStencil,
-        g_captureStats.lastRejectedClass,
-        (unsigned long long)g_totalFrames.load(), g_syncMap.size(), g_vtxCount);
+        (unsigned long long)frame.stats.droppedStencil,
+        frame.stats.lastRejectedClass,
+        (unsigned long long)frame.totalFrames, frame.cacheSize, (int)frame.vertices.size());
     dl->AddText({10, 46}, IM_COL32(0, 255, 0, 200), diagnostics);
     snprintf(diagnostics, sizeof(diagnostics),
         "rejected: stencil %llu | coord %llu | dist %llu | passed %llu",
-        (unsigned long long)g_captureStats.droppedStencil,
-        (unsigned long long)g_captureStats.rejectedCoord,
-        (unsigned long long)g_captureStats.rejectedDist,
-        (unsigned long long)g_captureStats.passed);
+        (unsigned long long)frame.stats.droppedStencil,
+        (unsigned long long)frame.stats.rejectedCoord,
+        (unsigned long long)frame.stats.rejectedDist,
+        (unsigned long long)frame.stats.passed);
     dl->AddText({10, 64}, IM_COL32(0, 255, 0, 200), diagnostics);
 }
