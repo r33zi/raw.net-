@@ -13,6 +13,7 @@
 #include <chrono>
 #include "frame_position.h"
 #include "async_snapshot.h"
+#include "overlay_projection.h"
 struct Vec3 { float x, y, z; };
 static uint64_t g_imageBase = 0;
 static uint64_t g_imageSize = 0;
@@ -107,7 +108,9 @@ struct OverlayVertex {
     float distance;
     Vec3 screenPos;
     bool onScreen;
+    bool projected;
     bool hasBones;
+    std::chrono::steady_clock::time_point bonesSampledAt{};
     SkeletonBones bones;
     Vec3 headScreenPos;
     bool headOnScreen;
@@ -121,6 +124,11 @@ struct RenderSyncEntry {
     uint64_t filter_byte = 0;
     std::chrono::steady_clock::time_point last_seen{};
     std::chrono::steady_clock::time_point position_time{};
+    SkeletonBones bones{};
+    Vec3 boneAnchor{};
+    std::chrono::steady_clock::time_point bonesSampledAt{};
+    bool hasBones = false;
+    char operatorName[32]{};
 };
 
 extern bool Aimbot;
@@ -288,7 +296,7 @@ static int FindBoundary(const uint8_t* c, int minB) {
 static void RefreshConfiguredProjection() {
     if (!g_pViewDataPtr) return;
     const uint64_t viewData = read<uint64_t>(g_pViewDataPtr);
-    if (IsValidAddr(viewData)) g_projectionAddr = viewData;
+    g_projectionAddr = IsValidAddr(viewData) ? viewData : 0;
 }
 
 static void CaptureProjectionFrame() {
@@ -301,9 +309,12 @@ static void CaptureProjectionFrame() {
     if (driver->ReadProcessMemory(
             g_projectionAddr + OFFSETS::ViewProjectionOffset,
             &g_frameProjection, sizeof(g_frameProjection)) != 0) return;
-    driver->ReadProcessMemory(
-        g_projectionAddr + OFFSETS::CameraPositionOffset,
-        &g_frameCamera, sizeof(g_frameCamera));
+    if (!overlay_projection::ValidMatrix(g_frameProjection.m)) return;
+    if (driver->ReadProcessMemory(
+            g_projectionAddr + OFFSETS::CameraPositionOffset,
+            &g_frameCamera, sizeof(g_frameCamera)) != 0 ||
+        !std::isfinite(g_frameCamera.x) || !std::isfinite(g_frameCamera.y) ||
+        !std::isfinite(g_frameCamera.z)) return;
     g_frameProjectionValid = true;
 }
 
@@ -314,14 +325,14 @@ static Matrix4x4 QueryProjectionMatrix() {
 static Vec3 QueryCameraOrigin() {
     return g_frameProjectionValid ? g_frameCamera : Vec3{};
 }
-static bool W2S(const Vec3& w, Vec3& s, int W, int H) {
-    if (!g_frameProjectionValid) return false;
-    Matrix4x4 v=QueryProjectionMatrix();
-    float ww=v.m[3]*w.x+v.m[7]*w.y+v.m[11]*w.z+v.m[15];
-    if (ww<0.001f) return false;
-    s.x=(W*.5f)*(w.x*v.m[0]+w.y*v.m[4]+w.z*v.m[8]+v.m[12])/ww+W*.5f;
-    s.y=-(H*.5f)*(w.x*v.m[1]+w.y*v.m[5]+w.z*v.m[9]+v.m[13])/ww+H*.5f;
-    s.z=ww; return s.x>=0&&s.y>=0&&s.x<=W&&s.y<=H;
+static bool ProjectToScreen(const Vec3& world, Vec3& screen, int width, int height) {
+    return g_frameProjectionValid && overlay_projection::Project(
+        g_frameProjection.m, world, screen, width, height);
+}
+
+static bool W2S(const Vec3& world, Vec3& screen, int width, int height) {
+    return ProjectToScreen(world, screen, width, height) &&
+        overlay_projection::Inside(screen, width, height);
 }
 
 #include "weather_fx.h"
@@ -374,14 +385,9 @@ static bool IsPlayerFilter(uint64_t entity, uint64_t stencil) {
 
 static bool ReadActorOrigin(uint64_t actor, Vec3& out) {
     if (!IsValidAddr(actor)) return false;
-    const uint64_t list = read<uint64_t>(actor + 0xE0);
-    uint8_t index = 0;
-    if (!IsValidAddr(list) ||
-        driver->ReadProcessMemory(actor + 0x1EF, &index, sizeof(index)) != 0)
-        return false;
-    const uint64_t component = read<uint64_t>(list + static_cast<uint64_t>(index) * 8);
-    if (!IsValidAddr(component) ||
-        (component >= g_imageBase && component - g_imageBase < g_imageSize)) return false;
+    // Use the same discovered list/index and component validation as bones.
+    const uint64_t component = skel::FindIndexedCharacterComponent(actor);
+    if (!IsValidAddr(component)) return false;
     return GetPhysWorldPos(component, out);
 }
 
@@ -703,7 +709,8 @@ static void ShutdownRenderPipeline() {
     if(g_log){fclose(g_log);g_log=nullptr;}
 }
 
-static void PollSyncBuffer(const CollectionRequest& request) {
+static void PollSyncBuffer(const CollectionRequest& request,
+    std::chrono::steady_clock::time_point& sampledAt) {
     const int W = request.width, H = request.height, maxD = request.maxDistance;
     DWORD now_tick = GetTickCount();
     g_vertexBuffer.clear(); g_vtxCount = 0; g_activeVtx = 0;
@@ -780,7 +787,6 @@ static void PollSyncBuffer(const CollectionRequest& request) {
         PollFallbackArray(cap);
     }
 
-    Vec3 cam = QueryCameraOrigin();
     auto now = std::chrono::steady_clock::now();
     float frame_dt = 1.f / 60.f;
     {
@@ -831,6 +837,30 @@ static void PollSyncBuffer(const CollectionRequest& request) {
         }
 
 
+        // Discovery/labels can be slow. Finish them before sampling the camera
+        // and live origins so a scan cannot make every new box frame stale.
+        for (auto& pair : g_syncMap) {
+            auto& entry = pair.second;
+            entry.hasBones = false;
+            entry.operatorName[0] = '\0';
+            if (request.skeleton) {
+                entry.bonesSampledAt = std::chrono::steady_clock::now();
+                entry.boneAnchor = entry.position;
+                entry.hasBones = ReadSkeleton(pair.first, entry.position.x,
+                    entry.position.y, entry.position.z, entry.bones) && entry.bones.total > 0;
+            }
+            const char* label = request.labels ? ResolveShaderLabel(pair.first) : nullptr;
+            if (label) {
+                strncpy(entry.operatorName, label, sizeof(entry.operatorName) - 1);
+                entry.operatorName[sizeof(entry.operatorName) - 1] = '\0';
+            }
+        }
+
+        sampledAt = std::chrono::steady_clock::now();
+        CaptureProjectionFrame();
+        const Vec3 cam = QueryCameraOrigin();
+        if (!g_frameProjectionValid) return;
+
         for (auto it = g_syncMap.begin(); it != g_syncMap.end(); ++it) {
             uint64_t ea = it->first;
             auto& entry = it->second;
@@ -839,9 +869,12 @@ static void PollSyncBuffer(const CollectionRequest& request) {
                 continue;
 
 
-            Vec3 draw_pos = entry.position;
-            if (!ValidateWorldCoord(draw_pos))
+            Vec3 draw_pos{};
+            if (!ReadActorOrigin(ea, draw_pos)) {
+                ++g_captureStats.rejectedCoord;
                 continue;
+            }
+            SyncFrameState(entry, draw_pos, std::chrono::steady_clock::now());
 
             float d = sqrtf(
                 (draw_pos.x - cam.x) * (draw_pos.x - cam.x) +
@@ -854,7 +887,8 @@ static void PollSyncBuffer(const CollectionRequest& request) {
             }
 
             Vec3 sp = {};
-            bool on = W2S(draw_pos, sp, W, H);
+            const bool projected = ProjectToScreen(draw_pos, sp, W, H);
+            const bool on = projected && overlay_projection::Inside(sp, W, H);
 
             OverlayVertex e = {};
             e.instance = ea;
@@ -864,26 +898,31 @@ static void PollSyncBuffer(const CollectionRequest& request) {
             e.distance = d;
             e.screenPos = sp;
             e.onScreen = on;
+            e.projected = projected;
             e.hasBones = false;
             e.headOnScreen = false;
             e.hp = 100;
             e.operatorName[0] = '\0';
 
-            if (request.skeleton && e.isPlayer &&
-                ReadSkeleton(ea, draw_pos.x, draw_pos.y, draw_pos.z, e.bones) &&
-                e.bones.total > 0) {
+            if (entry.hasBones && std::chrono::steady_clock::now() - entry.bonesSampledAt <
+                    std::chrono::milliseconds(250)) {
                 e.hasBones = true;
-                const Vec3B head = GetHeadBonePos(e.bones);
-                const Vec3 headWorld = { head.x, head.y, head.z };
-                e.headOnScreen = W2S(headWorld, e.headScreenPos, W, H);
+                e.bonesSampledAt = entry.bonesSampledAt;
+                e.bones = entry.bones;
+                // Preserve articulation while moving the sampled pose to the
+                // current live origin. Never republish an expired pose as fresh.
+                for (int bone = 0; bone < skel::BONE_COUNT; ++bone) {
+                    if (!e.bones.hasBone[bone]) continue;
+                    e.bones.bones[bone].x += draw_pos.x - entry.boneAnchor.x;
+                    e.bones.bones[bone].y += draw_pos.y - entry.boneAnchor.y;
+                    e.bones.bones[bone].z += draw_pos.z - entry.boneAnchor.z;
+                }
+                if (e.bones.hasBone[skel::BONE_HEAD] || e.bones.hasBone[skel::BONE_NECK]) {
+                    const Vec3B head = GetHeadBonePos(e.bones);
+                    e.headOnScreen = W2S(Vec3{head.x, head.y, head.z}, e.headScreenPos, W, H);
+                }
             }
-
-
-            const char* opName = request.labels ? ResolveShaderLabel(ea) : nullptr;
-            if (opName) {
-                strncpy(e.operatorName, opName, sizeof(e.operatorName) - 1);
-                e.operatorName[sizeof(e.operatorName) - 1] = '\0';
-            }
+            memcpy(e.operatorName, entry.operatorName, sizeof(e.operatorName));
 
             if (posDbg && g_vtxCount < 3) {
                 printf("[POS] entity=0x%llX pos=(%.1f,%.1f,%.1f) smooth=(%.1f,%.1f,%.1f) dist=%.0f on=%d\n",
@@ -920,8 +959,7 @@ static OverlaySnapshot CollectOverlaySnapshot(const CollectionRequest& request) 
     snapshot.collectedAt = std::chrono::steady_clock::now();
     snapshot.width = request.width;
     snapshot.height = request.height;
-    CaptureProjectionFrame();
-    PollSyncBuffer(request);
+    PollSyncBuffer(request, snapshot.collectedAt);
     snapshot.vertices = g_vertexBuffer;
     snapshot.projection = g_frameProjection;
     snapshot.camera = g_frameCamera;
@@ -979,7 +1017,9 @@ static void FlushOverlayPipeline(int W, int H, bool box, bool corner, bool line,
 
     for (const auto& e : frame.vertices) {
         if (!g_frameProjectionValid) break;
-        if (!e.onScreen) continue;
+        if (!e.projected) continue;
+        const bool bonesFresh = e.hasBones && std::chrono::steady_clock::now() -
+            e.bonesSampledAt < std::chrono::milliseconds(250);
         float sx = e.screenPos.x, sy = e.screenPos.y;
         float entOffset = (float)(e.instance & 0xFF) / 255.0f;
 
@@ -988,15 +1028,18 @@ static void FlushOverlayPipeline(int W, int H, bool box, bool corner, bool line,
 
         
         Vec3 headScr = e.headScreenPos;
-        bool headOn = e.hasBones && e.headOnScreen;
+        bool headOn = false;
+        if (bonesFresh && (e.bones.hasBone[skel::BONE_HEAD] || e.bones.hasBone[skel::BONE_NECK])) {
+            const Vec3B head = GetHeadBonePos(e.bones);
+            headOn = ProjectToScreen(Vec3{head.x, head.y, head.z}, headScr, W, H);
+        }
         if (!headOn) {
             const Vec3 headPos = {e.position.x, e.position.y, e.position.z + k_viewportHeight};
-            headOn = W2S(headPos, headScr, W, H);
+            headOn = ProjectToScreen(headPos, headScr, W, H);
         }
 
-        if (box && headOn) {
+        if (box && headOn && fabsf(sy - headScr.y) >= 4.f) {
             float boxH = fabsf(sy - headScr.y);
-            if (boxH < 4.f) continue;
             float boxW = boxH * 0.45f;
             float top = fminf(sy, headScr.y);
             float bot = fmaxf(sy, headScr.y);
@@ -1022,20 +1065,7 @@ static void FlushOverlayPipeline(int W, int H, bool box, bool corner, bool line,
             }
         }
 
-        if (line) {
-            extern int snaplineOrigin;
-            ImVec2 from;
-            if (snaplineOrigin == 0) from = ImVec2((float)W/2, 0);           
-            else if (snaplineOrigin == 1) from = ImVec2((float)W/2, (float)H/2); 
-            else from = ImVec2((float)W/2, (float)H);                        
-            dl->AddLine(from, {sx, sy}, snapCol, snaplineThickness);
-        }
-
-        if (lineheadesp && headOn) {
-            dl->AddLine({sx, sy}, {(float)headScr.x, (float)headScr.y}, IM_COL32(255,255,0,200), 1.0f);
-        }
-
-        if (Esp_skeleton && e.hasBones) {
+        if (Esp_skeleton && bonesFresh) {
             const ImU32 skeletonColor = ColorToU32(espSkeletonColor);
             const SkeletonBones& bones = e.bones;
             auto drawBone = [&](int first, int second) {
@@ -1047,7 +1077,8 @@ static void FlushOverlayPipeline(int W, int H, bool box, bool corner, bool line,
                     bones.bones[second].x, bones.bones[second].y, bones.bones[second].z
                 };
                 Vec3 firstScreen{}, secondScreen{};
-                if (W2S(firstWorld, firstScreen, W, H) && W2S(secondWorld, secondScreen, W, H)) {
+                if (ProjectToScreen(firstWorld, firstScreen, W, H) &&
+                    ProjectToScreen(secondWorld, secondScreen, W, H)) {
                     dl->AddLine({firstScreen.x, firstScreen.y},
                         {secondScreen.x, secondScreen.y}, skeletonColor, skeletonThickness);
                 }
@@ -1055,6 +1086,21 @@ static void FlushOverlayPipeline(int W, int H, bool box, bool corner, bool line,
             for (int i = 0; i < skel::kNumConnections; ++i) {
                 drawBone(skel::kConnections[i].first, skel::kConnections[i].second);
             }
+        }
+
+        // Screen-bound labels, snaplines and targeting retain their old gate.
+        if (!e.onScreen) continue;
+        if (line) {
+            extern int snaplineOrigin;
+            ImVec2 from;
+            if (snaplineOrigin == 0) from = ImVec2((float)W/2, 0);
+            else if (snaplineOrigin == 1) from = ImVec2((float)W/2, (float)H/2);
+            else from = ImVec2((float)W/2, (float)H);
+            dl->AddLine(from, {sx, sy}, snapCol, snaplineThickness);
+        }
+
+        if (lineheadesp && headOn) {
+            dl->AddLine({sx, sy}, {(float)headScr.x, (float)headScr.y}, IM_COL32(255,255,0,200), 1.0f);
         }
 
         if (dist) {
@@ -1183,7 +1229,7 @@ static void FlushOverlayPipeline(int W, int H, bool box, bool corner, bool line,
                 Vec3 aimScr = {};
                 bool aimOn = false;
                 if (skeletonAim) {
-                    if (e.hasBones && e.headOnScreen) {
+                    if (bonesFresh && e.headOnScreen) {
                         aimScr = e.headScreenPos;
                         aimOn = true;
                     }
@@ -1262,6 +1308,21 @@ static void FlushOverlayPipeline(int W, int H, bool box, bool corner, bool line,
             g_wfxInited = false;
         }
     }
+
+    const auto ageMs = g_renderSnapshot ?
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - frame.collectedAt).count() : -1;
+    int projectedCount = 0, boneCount = 0;
+    for (const auto& vertex : frame.vertices) {
+        projectedCount += vertex.projected ? 1 : 0;
+        boneCount += vertex.hasBones ? 1 : 0;
+    }
+    char stage[256];
+    snprintf(stage, sizeof(stage),
+        "ESP: pipeline %s | worker %s | camera %s | age %lldms | projected %d | bones %d",
+        g_pipelineReady ? "ready" : "failed", g_collectionWorker.Failed() ? "failed" : (g_pipelineReady ? "running" : "stopped"),
+        frame.projectionValid ? "valid" : "unavailable", (long long)ageMs, projectedCount, boneCount);
+    dl->AddText({10, 82}, IM_COL32(255, 220, 100, 220), stage);
 
     char info[256];
     snprintf(info, 256, "P:%d E:%d Hook:%s Rnd:%d Cache:%d",

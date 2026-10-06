@@ -169,6 +169,7 @@
     <ClInclude Include="build_118144515.h" />
     <ClInclude Include="pasterx.h" />
     <ClInclude Include="r6_entities.h" />
+    <ClInclude Include="overlay_projection.h" />
     <ClInclude Include="r6_bone_ids.h" />
     <ClInclude Include="r6_bones.h" />
     <ClInclude Include="r6_scanner.h" />

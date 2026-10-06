@@ -222,6 +222,20 @@ namespace skel
         return 0;
     }
 
+    inline uint64_t FindIndexedCharacterComponent(uint64_t entity)
+    {
+        if (!ValidPtr(entity)) return 0;
+        uint64_t list = 0;
+        uint8_t index = 0;
+        if (!ReadRaw(entity + g_componentArrayOffset, &list, sizeof(list)) ||
+            !ValidPtr(list) || !ReadRaw(entity + g_compIdxOff, &index, sizeof(index)) ||
+            index >= 200) return 0;
+        const uint64_t component = Read<uint64_t>(list + static_cast<uint64_t>(index) * 8);
+        if (!ValidPtr(component) ||
+            (component >= g_imageBase && component - g_imageBase < g_imageSize)) return 0;
+        return component;
+    }
+
     inline uint64_t FindCharacterComponent(uint64_t entity, float dx = 0.f, float dy = 0.f, float dz = 0.f)
     {
         if (!ValidPtr(entity)) return 0;
@@ -244,12 +258,7 @@ namespace skel
         // live-position field is unavailable.  Bound the index to the list
         // range scanned above so corrupt entity data cannot probe arbitrary
         // process memory.
-        const uint8_t index = Read<uint8_t>(entity + g_compIdxOff);
-        if (index >= 200) return 0;
-        const uint64_t component = Read<uint64_t>(list + (uint64_t)index * 8);
-        if (!ValidPtr(component) ||
-            (component >= g_imageBase && component - g_imageBase < g_imageSize)) return 0;
-        return component;
+        return FindIndexedCharacterComponent(entity);
     }
 
 
