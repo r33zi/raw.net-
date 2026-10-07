@@ -24,16 +24,17 @@ def function(path, signature):
 
 source = r'''
 #include "overlay_projection.h"
+#include "class_manager.h"
 #include "game_signatures.h"
 #include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <map>
 #include <limits>
+using DWORD = uint32_t;
 struct Vec3 { float x,y,z; };
 struct Matrix4x4 { float m[16]; };
 static game_signatures::Layout g_gameLayout{};
-using DWORD = uint32_t;
 static uint64_t g_imageBase = 0x10000000, g_imageSize = 0x1000;
 static uint64_t g_pViewDataPtr = 0x500000, g_projectionAddr = 0;
 static Matrix4x4 g_frameProjection{};
@@ -75,10 +76,42 @@ bool GetPhysWorldPos(uint64_t component, Vec3& out) {
 }
 '''
 for name in ("static bool PollGameManager(", "static bool ReadActorOrigin(", "static void RefreshConfiguredProjection(",
-             "static void CaptureProjectionFrame("):
+             "static void CaptureProjectionFrame(", "static bool ReadEntityClassId("):
     source += function("reverse/r6_entities.h", name) + "\n"
 source += r'''
 int main() {
+    const auto reader = [](uint64_t a, void* out, size_t n) {
+        return memory.ReadProcessMemory(a, out, n) == 0;
+    };
+    const uint64_t object = 0x700000, vtable = 0x710000;
+    const uint64_t entry = 0x720000, descriptor = 0x730000;
+    memory.Put(object, vtable);
+    memory.Put(vtable, entry);
+    memory.Put(entry + 8, descriptor);
+    // Independent known answers include uint32 subtraction wraparound and zero.
+    for (const auto& test : {std::pair<uint32_t,uint32_t>{0, 0xB6BF1B01},
+                            {0x826F3CF6, 0xCB2FD80B}, {0x4D9F1501, 0}}) {
+        memory.Put(descriptor + 0x1C, test.first);
+        uint32_t id = 123;
+        assert(class_manager::TryGetClassId(object, id, reader));
+        assert(id == test.second);
+        assert(ReadEntityClassId(object, id) && id == test.second);
+    }
+    for (uint64_t address : {object, vtable, entry + 8, descriptor + 0x1C}) {
+        const auto saved = memory.bytes;
+        memory.bytes.erase(address);
+        uint32_t id = 123;
+        assert(!class_manager::TryGetClassId(object, id, reader) && id == 0);
+        memory.bytes = saved;
+    }
+    for (uint64_t invalid : {uint64_t{0}, UINT64_MAX, uint64_t{0x7FFFFFFFFFFE}}) {
+        uint32_t id = 123;
+        assert(!class_manager::TryGetClassId(invalid, id, reader) && id == 0);
+        memory.Put(entry + 8, invalid);
+        assert(!class_manager::TryGetClassId(object, id, reader) && id == 0);
+    }
+    memory.Put(entry + 8, descriptor);
+
     using namespace game_signatures;
     g_gameLayout[static_cast<size_t>(Field::GameManager)] = {Status::Resolved, 0x700000};
     g_gameLayout[static_cast<size_t>(Field::EntityList)] = {Status::Resolved, 0x10};

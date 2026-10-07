@@ -21,6 +21,7 @@
   <ItemGroup>
     <ClInclude Include="ud.h" />
     <ClInclude Include="Keybind.h" />
+    <ClInclude Include="class_manager.h" />
     <ClInclude Include="offsets.h" />
     <ClInclude Include="async_snapshot.h" />
     <ClInclude Include="build_118144515.h" />

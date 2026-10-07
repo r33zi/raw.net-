@@ -13,6 +13,7 @@
 #include <chrono>
 #include "frame_position.h"
 #include "async_snapshot.h"
+#include "class_manager.h"
 #include "overlay_projection.h"
 struct Vec3 { float x, y, z; };
 static uint64_t g_imageBase = 0;
@@ -452,6 +453,13 @@ static void FindRound() {
     }
 }
 
+static bool ReadEntityClassId(uint64_t entity, uint32_t& id) {
+    return class_manager::TryGetClassId(entity, id,
+        [](uint64_t address, void* out, size_t size) {
+            return driver->ReadProcessMemory(address, out, static_cast<DWORD>(size)) == 0;
+        });
+}
+
 static void PollFrameRing() {
     if (!g_RingAddr) return;
     uint64_t wi = read<uint64_t>(g_RingAddr);
@@ -474,7 +482,7 @@ static void PollFrameRing() {
             ++g_captureStats.badVtable; ++g_ReadIdx; continue;
         }
         uint32_t id = 0;
-        if (driver->ReadProcessMemory(entity + 0x1C, &id, sizeof(id)) != 0 || !id) {
+        if (!ReadEntityClassId(entity, id)) {
             ++g_captureStats.badId; ++g_ReadIdx; continue;
         }
         { std::lock_guard<std::mutex> lock(g_frameMtx); g_capturedFrames.insert(entity); }
@@ -557,7 +565,7 @@ static void PollFallbackArray(std::vector<uint64_t>& captured) {
         uint32_t id = 0;
         if (driver->ReadProcessMemory(entity, &vtable, sizeof(vtable)) == 0 &&
             vtable >= g_imageBase && vtable - g_imageBase < g_imageSize &&
-            driver->ReadProcessMemory(entity + 0x1C, &id, sizeof(id)) == 0 && id)
+            ReadEntityClassId(entity, id))
             captured.push_back(entity);
     }
 }

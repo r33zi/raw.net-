@@ -63,6 +63,25 @@ unavailable camera indicates pointer/read/matrix failure; coordinate rejections
 indicate the actor/component position path. A high sample age indicates stalled
 reads. None of these Windows/live checks can run in the Linux sandbox.
 
+## Supplied class decoder integration
+
+Ring capture and fallback-array capture now validate the supplied descriptor
+read chain (`entity -> vtable -> first entry -> pointer at +0x8`, then the
+32-bit field at descriptor `+0x1C`) through checked driver reads. The class ID
+is decoded with `(raw - 0x826F3CF6) ^ 0xCB2FD80B` using 32-bit arithmetic.
+This replaces the direct `entity + 0x1C` rejection in both paths. A zero decoded
+ID is accepted when all reads succeed; player class IDs were not supplied, so
+this is not a player classification filter. The supplied chain and constants
+still require verification against the running build.
+
+The supplied GameManager translation is not executable as provided: it contains
+zero input registers, a write to address 0xA0, a synthetic stack read at 0x40,
+and omitted instructions/call results. Its TLS reads would also need the target
+thread context. The attached manager address is outside the captured module;
+its wrapped RVA is not a stable module-relative offset. Neither is used for
+runtime discovery. Original disassembly and live diagnostics are still needed
+to complete that path and verify box ESP end to end.
+
 ## Initialization failures
 
 `pipeline failed | worker stopped` means initialization returned before the
