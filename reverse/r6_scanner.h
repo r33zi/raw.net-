@@ -186,10 +186,15 @@ static bool CacheTextSection(uint64_t base, const std::vector<PESection>& secs) 
 }
 
 struct CallTarget { uint64_t callVA, targetVA, anchorVA; bool hasTestAlAl; };
+static const char* g_entityScanError = nullptr;
 
 static std::vector<CallTarget> FindEntityFunctionCalls(uint64_t moduleBase) {
     std::vector<CallTarget> res;
-    if (!g_textCache.valid) return res;
+    g_entityScanError = nullptr;
+    if (!g_textCache.valid) {
+        g_entityScanError = "code cache unavailable";
+        return res;
+    }
     const uint8_t* t = g_textCache.data.data();
     size_t sz = (size_t)g_textCache.textSize;
     uint64_t tb = g_textCache.textBase;
@@ -220,8 +225,12 @@ static std::vector<CallTarget> FindEntityFunctionCalls(uint64_t moduleBase) {
     }
     printf("[ENTITY-SCAN] %d anchors, %zu calls\n", anchors, res.size());
     if (anchors < 1 || anchors > 2) {
+        g_entityScanError = anchors < 1 ? "entity anchor not found; signature update required" :
+            "entity anchor ambiguous; signature update required";
         printf("[ENTITY-SCAN] Anchor missing or ambiguous; refusing to hook\n");
         res.clear();
+    } else if (res.empty()) {
+        g_entityScanError = "entity anchor found without a usable call target";
     }
     std::sort(res.begin(),res.end(),[](auto&a,auto&b){return a.hasTestAlAl>b.hasTestAlAl;});
     return res;

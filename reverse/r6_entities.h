@@ -187,6 +187,14 @@ static constexpr DWORD REARM_MS = 1000;
 
 static std::vector<OverlayVertex> g_vertexBuffer;
 static bool g_pipelineReady = false;
+static const char* g_pipelineError = "not initialized";
+
+static bool FailRenderPipeline(const char* reason) {
+    g_pipelineReady = false;
+    g_pipelineError = reason;
+    printf("[R6] Pipeline failed: %s\n", reason);
+    return false;
+}
 static int g_roundState = -1;
 static int g_vtxCount = 0, g_activeVtx = 0;
 static std::unordered_set<uint64_t> g_capturedFrames;
@@ -658,12 +666,16 @@ static void AppendTrailSample(TrailBuffer* t, Vec3 pos) {
 }
 
 static bool InitRenderPipeline(uint64_t base, uint64_t size) {
+    g_pipelineReady = false;
+    g_pipelineError = "initializing";
+    g_frameSyncAddr = 0;
     g_imageBase=base;
     g_imageSize=size;
     ValidateBuild118144515Entries(base, size);
     auto secs=GetPESections(base);
-    if(secs.empty()) return false;
-    if(!CacheTextSection(base,secs)) return false;
+    if(secs.empty()) return FailRenderPipeline("PE headers unreadable or invalid");
+    if(!CacheTextSection(base,secs))
+        return FailRenderPipeline("code section missing or unreadable; see [SCAN] log");
     ScanConfiguredPointers(base);
     ScanGameLayout();
     const bool managerAvailable = game_signatures::CanReadEntities(g_gameLayout);
@@ -678,7 +690,12 @@ static bool InitRenderPipeline(uint64_t base, uint64_t size) {
         g_ShellPage=driver->AllocMemory(0x6000, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
         if (g_ShellPage) g_RingAddr=g_ShellPage+0x1000;
     }
-    if (!managerAvailable && !g_RingAddr) return false;
+    if (!managerAvailable && !g_RingAddr) {
+        if (!g_frameSyncAddr)
+            return FailRenderPipeline(g_entityScanError ? g_entityScanError :
+                "multiple entity targets; matching build signature required");
+        return FailRenderPipeline("capture allocation failed");
+    }
     printf("[R6] GameManager list: %s; capture fallback: %s\n",
         managerAvailable ? "configured (live reads pending)" : "unavailable",
         g_RingAddr ? "available" : "unavailable");
@@ -712,6 +729,7 @@ static bool InitRenderPipeline(uint64_t base, uint64_t size) {
 
 
     g_pipelineReady = true;
+    g_pipelineError = nullptr;
     printf("[R6] Position system: indexed skeleton component, paired positions\n");
     return true;
 }
@@ -719,6 +737,7 @@ static bool InitRenderPipeline(uint64_t base, uint64_t size) {
 static void ShutdownRenderPipeline() {
     g_collectionWorker.Stop();
     g_pipelineReady = false;
+    g_pipelineError = "stopped";
     if(g_frameSyncActive && !DetachFrameSync())
         printf("[HOOK] Restore failed; keeping capture allocation live\n");
     if (g_registryScanThread) {
@@ -1348,7 +1367,8 @@ static void FlushOverlayPipeline(int W, int H, bool box, bool corner, bool line,
         }
     }
 
-    const auto ageMs = g_renderSnapshot ?
+    const bool sampled = frame.collectedAt != std::chrono::steady_clock::time_point{};
+    const auto ageMs = sampled ?
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - frame.collectedAt).count() : -1;
     int projectedCount = 0, boneCount = 0;
@@ -1360,8 +1380,13 @@ static void FlushOverlayPipeline(int W, int H, bool box, bool corner, bool line,
     snprintf(stage, sizeof(stage),
         "ESP: pipeline %s | worker %s | camera %s | age %lldms | projected %d | bones %d",
         g_pipelineReady ? "ready" : "failed", g_collectionWorker.Failed() ? "failed" : (g_pipelineReady ? "running" : "stopped"),
-        frame.projectionValid ? "valid" : "unavailable", (long long)ageMs, projectedCount, boneCount);
+        !sampled ? "not sampled" : (frame.projectionValid ? "valid" : "unavailable"),
+        (long long)ageMs, projectedCount, boneCount);
     dl->AddText({10, 82}, IM_COL32(255, 220, 100, 220), stage);
+    if (g_pipelineError) {
+        snprintf(stage, sizeof(stage), "ESP startup: %s", g_pipelineError);
+        dl->AddText({10, 100}, IM_COL32(255, 140, 100, 220), stage);
+    }
 
     char info[256];
     snprintf(info, 256, "P:%d E:%d Hook:%s Rnd:%d Cache:%d",
