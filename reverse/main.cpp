@@ -422,7 +422,10 @@ int main(int argc, const char* argv[]) {
         return 1;
     }
     printf("[+] DirectX 9 OK\n");
-    printf("\n[*] ALL SYSTEMS GO\n");
+    if (g_pipelineReady)
+        printf("\n[*] Overlay ready; ESP initialized\n");
+    else
+        printf("\n[!] Overlay ready; ESP unavailable: %s\n", g_pipelineError);
     Sleep(3000);
     ShowWindow(GetConsoleWindow(), SW_HIDE);
     xMainLoop();
@@ -904,6 +907,8 @@ void render() {
             ImGui::Text("Menu: %.1f FPS", ImGui::GetIO().Framerate);
             if (!g_pipelineReady || g_collectionWorker.Failed())
                 ImGui::TextUnformatted("Game data unavailable");
+            if (g_pipelineError)
+                ImGui::TextWrapped("ESP startup: %s", g_pipelineError);
 
             ImGui::PushItemWidth(220.0f);
             ImGui::PopItemWidth();
