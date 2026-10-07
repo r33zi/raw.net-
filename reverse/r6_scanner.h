@@ -7,6 +7,7 @@
 #include <vector>
 #include "driver.h"
 #include "offsets.h"
+#include "game_signatures.h"
 
 // Diagnostic validation only: these signatures do not establish the file hash
 // or provide decoders for the encoded fields in the build metadata.
@@ -67,6 +68,28 @@ struct TextSectionCache {
     bool valid = false;
 };
 static TextSectionCache g_textCache;
+static game_signatures::Layout g_gameLayout{};
+
+static void ScanGameLayout() {
+    g_gameLayout = {};
+    if (!g_textCache.valid) return;
+    g_gameLayout = game_signatures::Scan(g_textCache.data.data(),
+        g_textCache.data.size(), g_textCache.textBase);
+    bool printed[static_cast<size_t>(game_signatures::Field::Count)]{};
+    for (const auto& sig : game_signatures::Signatures) {
+        const auto index = static_cast<size_t>(sig.field);
+        if (printed[index]) continue;
+        printed[index] = true;
+        const auto& result = g_gameLayout[index];
+        const char* status = result.status == game_signatures::Status::Resolved ? "resolved" :
+            result.status == game_signatures::Status::Ambiguous ? "ambiguous" :
+            result.status == game_signatures::Status::Invalid ? "invalid" : "missing";
+        const char* kind = sig.encoding == game_signatures::Encoding::Rip32 ? "pointer-slot" :
+            sig.encoding == game_signatures::Encoding::RipAddress32 ? "direct-address" : "offset";
+        printf("[LAYOUT] %s: %s 0x%llX (%s)\n", sig.name, status,
+            (unsigned long long)result.value, kind);
+    }
+}
 
 // Resolve the pointer variable referenced by a seven-byte RIP-relative load
 // at the requested offset within a configured signature match.

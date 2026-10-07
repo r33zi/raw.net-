@@ -24,6 +24,7 @@ def function(path, signature):
 
 source = r'''
 #include "overlay_projection.h"
+#include "game_signatures.h"
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -31,6 +32,8 @@ source = r'''
 #include <limits>
 struct Vec3 { float x,y,z; };
 struct Matrix4x4 { float m[16]; };
+static game_signatures::Layout g_gameLayout{};
+using DWORD = uint32_t;
 static uint64_t g_imageBase = 0x10000000, g_imageSize = 0x1000;
 static uint64_t g_pViewDataPtr = 0x500000, g_projectionAddr = 0;
 static Matrix4x4 g_frameProjection{};
@@ -71,11 +74,31 @@ bool GetPhysWorldPos(uint64_t component, Vec3& out) {
     lastComponent = component; out = {1,2,3}; return true;
 }
 '''
-for name in ("static bool ReadActorOrigin(", "static void RefreshConfiguredProjection(",
+for name in ("static bool PollGameManager(", "static bool ReadActorOrigin(", "static void RefreshConfiguredProjection(",
              "static void CaptureProjectionFrame("):
     source += function("reverse/r6_entities.h", name) + "\n"
 source += r'''
 int main() {
+    using namespace game_signatures;
+    g_gameLayout[static_cast<size_t>(Field::GameManager)] = {Status::Resolved, 0x700000};
+    g_gameLayout[static_cast<size_t>(Field::EntityList)] = {Status::Resolved, 0x10};
+    g_gameLayout[static_cast<size_t>(Field::EntityCount)] = {Status::Resolved, 0x20};
+    g_gameLayout[static_cast<size_t>(Field::EntityArray)] = {Status::Resolved, 0x28};
+    memory.Put(0x700000, uint64_t{0x800000});
+    memory.Put(0x800010, uint64_t{0x900000});
+    memory.Put(0x900020, int32_t{1});
+    memory.Put(0x900028, uint64_t{0xA00000});
+    memory.Put(0xA00000, uint64_t{0x200000});
+    memory.Put(0x200000, g_imageBase + 0x10);
+    std::vector<uint64_t> actors;
+    assert(PollGameManager(actors) && actors.size() == 1 && actors[0] == 0x200000);
+    memory.Put(0x200000, g_imageBase + g_imageSize); // Reject non-module vtables.
+    assert(!PollGameManager(actors) && actors.empty());
+    memory.bytes.erase(0x200000); // Failed vtable read must also clear results.
+    assert(!PollGameManager(actors) && actors.empty());
+    memory.Put(0x900020, int32_t{0});
+    assert(PollGameManager(actors) && actors.empty());
+
     const uint64_t actor=0x200000, list=0x300000, component=0x400000, camera=0x600000;
     Vec3 position{};
     // Discovery changes both offsets. No legacy fields exist in this fixture.
