@@ -46,10 +46,14 @@ repository inspection.
 g++ -std=c++20 -Wall -Wextra -Werror -pedantic -Ireverse tests/overlay_projection_test.cpp -o /tmp/overlay_projection_test
 /tmp/overlay_projection_test
 python3 tests/esp_readers_test.py
+python3 tests/esp_initialization_test.py
 ```
 
 The reader test compiles selected production functions against synthetic memory;
-it does not compile the Windows application or exercise the driver.
+it does not compile the Windows application or exercise the driver. The
+initialization test also compiles production startup code with synthetic discovery
+and allocation results, covering GameManager-only startup, capture fallback,
+and the failure messages when neither source is available.
 
 Build Release x64 with the declared Windows/MSVC/DirectX SDK toolchain, then
 check boxes at viewport edges, moving actors during capture gaps, and enabling
@@ -65,7 +69,10 @@ reads. None of these Windows/live checks can run in the Linux sandbox.
 worker was started. `camera not sampled` distinguishes this from a failed camera
 read. The overlay and ESP menu now show the startup failure reason: PE headers,
 code-section reads, missing or ambiguous entity anchors, multiple entity targets,
-or capture allocation. Consult the corresponding startup console messages.
+or capture allocation. Entity discovery and capture allocation failures prevent
+startup only when the GameManager list layout is also unavailable. A configured
+GameManager path can initialize without capture; its live reads still require
+validation. Consult the corresponding startup console messages.
 
 The reported startup log successfully cached the code section, then found 36
 entity-call anchors and two candidate calls. The scanner rejected the ambiguous
