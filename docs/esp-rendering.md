@@ -58,3 +58,25 @@ ESP remains absent. A failed pipeline indicates initialization/capture discovery
 unavailable camera indicates pointer/read/matrix failure; coordinate rejections
 indicate the actor/component position path. A high sample age indicates stalled
 reads. None of these Windows/live checks can run in the Linux sandbox.
+
+## Initialization failures
+
+`pipeline failed | worker stopped` means initialization returned before the
+worker was started. `camera not sampled` distinguishes this from a failed camera
+read. The overlay and ESP menu now show the startup failure reason: PE headers,
+code-section reads, missing or ambiguous entity anchors, multiple entity targets,
+or capture allocation. Consult the corresponding startup console messages.
+
+The reported startup log successfully cached the code section, then found 36
+entity-call anchors and two candidate calls. The scanner rejected the ambiguous
+anchor before capture or camera sampling could start. The same log reported
+0/12 HUD 118144515 entry signatures matching and no configured view/camera
+pointer signature matches. This does not establish the running build number or
+prove why bytes differ (for example, a different build or runtime code changes).
+
+Do not raise the anchor limit or select an arbitrary call to suppress this
+failure. Matching executable bytes and the current game build are required to
+verify a replacement entity signature and the camera decoding path. Collect a
+dump of the running module together with the `[BUILD]`, `[SCAN]`, and
+`[ENTITY-SCAN]` log lines. Live box rendering remains unverified until those
+build-specific paths are resolved and exercised with the Windows game/driver.
