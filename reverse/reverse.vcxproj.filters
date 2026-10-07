@@ -42,6 +42,7 @@
     <ClInclude Include="r6_bone_ids.h" />
     <ClInclude Include="r6_bones.h" />
     <ClInclude Include="r6_scanner.h" />
+    <ClInclude Include="game_signatures.h" />
     <ClInclude Include="skel.h" />
     <ClInclude Include="skel_autodiscover.h" />
     <ClInclude Include="antitamper.h" />

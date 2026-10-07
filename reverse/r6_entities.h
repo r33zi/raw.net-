@@ -493,6 +493,24 @@ static void PollFrameRing() {
     }
 }
 
+// The signature list is a source of actor pointers; the existing player and
+// position validators still apply before any actor reaches the overlay.
+static bool PollGameManager(std::vector<uint64_t>& actors) {
+    if (!game_signatures::ReadEntities(g_gameLayout,
+        [](uint64_t address, void* data, size_t bytes) {
+            return driver->ReadProcessMemory(address, data, static_cast<DWORD>(bytes)) == 0;
+        }, actors)) return false;
+    for (auto actor : actors) {
+        uint64_t vtable = 0;
+        if (driver->ReadProcessMemory(actor, &vtable, sizeof(vtable)) != 0 ||
+            vtable < g_imageBase || vtable - g_imageBase >= g_imageSize) {
+            actors.clear();
+            return false;
+        }
+    }
+    return true;
+}
+
 static uint64_t FindFallbackArray(const std::unordered_set<uint64_t>& needles) {
     if (needles.size() < 2 || g_fallbackAttempts >= 2) return 0;
     ++g_fallbackAttempts;
@@ -667,6 +685,8 @@ static bool InitRenderPipeline(uint64_t base, uint64_t size) {
     if(!CacheTextSection(base,secs))
         return FailRenderPipeline("code section missing or unreadable; see [SCAN] log");
     ScanConfiguredPointers(base);
+    ScanGameLayout();
+    const bool managerAvailable = game_signatures::CanReadEntities(g_gameLayout);
     auto calls=FindEntityFunctionCalls(base);
 
     std::unordered_set<uint64_t> candidates;
@@ -674,11 +694,19 @@ static bool InitRenderPipeline(uint64_t base, uint64_t size) {
     if (candidates.empty()) for (const auto& call : calls) candidates.insert(call.targetVA);
     if (candidates.size() == 1) g_frameSyncAddr = *candidates.begin();
     else printf("[ENTITY-SCAN] %zu entity targets; refusing ambiguous hook\n", candidates.size());
-    if(!g_frameSyncAddr) return FailRenderPipeline(g_entityScanError ? g_entityScanError :
-        "multiple entity targets; matching build signature required");
-    g_ShellPage=driver->AllocMemory(0x6000, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
-    if(!g_ShellPage) return FailRenderPipeline("capture allocation failed");
-    g_RingAddr=g_ShellPage+0x1000;
+    if (g_frameSyncAddr) {
+        g_ShellPage=driver->AllocMemory(0x6000, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+        if (g_ShellPage) g_RingAddr=g_ShellPage+0x1000;
+    }
+    if (!managerAvailable && !g_RingAddr) {
+        if (!g_frameSyncAddr)
+            return FailRenderPipeline(g_entityScanError ? g_entityScanError :
+                "multiple entity targets; matching build signature required");
+        return FailRenderPipeline("capture allocation failed");
+    }
+    printf("[R6] GameManager list: %s; capture fallback: %s\n",
+        managerAvailable ? "configured (live reads pending)" : "unavailable",
+        g_RingAddr ? "available" : "unavailable");
     FindRound();
     if (!g_pViewDataPtr && OFFSETS::ViewMatrixRva + sizeof(uint64_t) <= size) {
         const uint64_t configuredViewPtr = base + OFFSETS::ViewMatrixRva;
@@ -782,8 +810,22 @@ static void PollSyncBuffer(const CollectionRequest& request,
         printf("[HOOK] Delay %dms before patching\\n", s_hookDelayMs);
     }
 
+    std::vector<uint64_t> cap;
+    const bool managerRead = isGameplay && PollGameManager(cap);
+    if (posDbg && game_signatures::CanReadEntities(g_gameLayout))
+        printf("[GAME-MANAGER] read=%s actors=%zu\n", managerRead ? "ok" : "unavailable", cap.size());
+    if (managerRead) {
+        // Drop actors removed from an authoritative list, including an empty list.
+        const std::unordered_set<uint64_t> live(cap.begin(), cap.end());
+        std::lock_guard<std::mutex> lock(g_syncMapMtx);
+        for (auto it = g_syncMap.begin(); it != g_syncMap.end(); ) {
+            if (!live.count(it->first)) it = g_syncMap.erase(it);
+            else ++it;
+        }
+    }
+
     bool delayPassed = (s_hookDelayStart > 0 && (now_tick - s_hookDelayStart) >= s_hookDelayMs);
-    if (!g_frameSyncActive && isGameplay && delayPassed &&
+    if (!managerRead && g_RingAddr && !g_frameSyncActive && isGameplay && delayPassed &&
         static_cast<int32_t>(now_tick - g_nextArmTick) >= 0) {
         if (!AttachFrameSync()) g_nextArmTick = now_tick + 5000;
     }
@@ -793,13 +835,12 @@ static void PollSyncBuffer(const CollectionRequest& request,
             PollFrameRing();
     }
 
-    std::vector<uint64_t> cap;
     {
         std::lock_guard<std::mutex> l(g_frameMtx);
-        cap.assign(g_capturedFrames.begin(), g_capturedFrames.end());
+        if (!managerRead) cap.assign(g_capturedFrames.begin(), g_capturedFrames.end());
         g_capturedFrames.clear();
     }
-    if (cap.empty() && g_lastValidCapture &&
+    if (!managerRead && cap.empty() && g_lastValidCapture &&
         now_tick - g_lastValidCapture > 2500) {
         std::unordered_set<uint64_t> needles;
         {
@@ -1066,8 +1107,10 @@ static void FlushOverlayPipeline(int W, int H, bool box, bool corner, bool line,
             float boxW = boxH * 0.45f;
             float top = fminf(sy, headScr.y);
             float bot = fmaxf(sy, headScr.y);
-            float left = sx - boxW * 0.5f;
-            float right = sx + boxW * 0.5f;
+            // Leaning/perspective can move the head away from the feet in X.
+            // Include both projected anchors in the horizontal bounds.
+            float left = fminf(sx, headScr.x) - boxW * 0.5f;
+            float right = fmaxf(sx, headScr.x) + boxW * 0.5f;
 
             if (fillbox) {
                 dl->AddRectFilled({left, top}, {right, bot}, ColorToU32(filledBoxColor));
